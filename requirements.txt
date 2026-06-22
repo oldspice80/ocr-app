@@ -1,0 +1,4 @@
+# Codex 데스크톱 번들에 포함된 패키지만 사용합니다.
+pdfplumber>=0.11
+Pillow>=12
+

@@ -1,0 +1,2 @@
+"""MathBank Studio application package."""
+
