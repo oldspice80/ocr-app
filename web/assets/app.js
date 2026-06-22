@@ -16,7 +16,7 @@ const modalContent = document.querySelector('#modal-content');
 
 const titles = {
   dashboard: ['WORKSPACE', '오늘의 문제은행'],
-  upload: ['DOCUMENT INTAKE', 'PDF에서 문제 가져오기'],
+  upload: ['DOCUMENT INTAKE', 'PDF·이미지에서 문제 가져오기'],
   review: ['QUALITY CONTROL', '추출 결과 검수'],
   bank: ['PROBLEM LIBRARY', '문제은행'],
   exams: ['ASSESSMENT BUILDER', '시험지 제작'],
@@ -149,7 +149,7 @@ async function renderDashboard() {
     <section class="hero">
       <div><span class="hero-kicker">ACCURACY FIRST WORKFLOW</span><h2>한 문제도 조용히<br>사라지지 않도록.</h2>
       <p>원본 좌표와 추출 결과를 함께 보존합니다. 자동 처리가 애매하면 통과시키지 않고 검수함에 남깁니다.</p></div>
-      <div class="hero-action"><button data-go="upload">새 PDF 분석하기</button><small>PDF · 최대 ${state.config.max_upload_mb}MB</small></div>
+      <div class="hero-action"><button data-go="upload">새 파일 분석하기</button><small>PDF·JPG·PNG · 최대 ${state.config.max_upload_mb}MB</small></div>
     </section>
     <section class="stat-grid">
       <article class="stat-card"><small>등록된 문제</small><strong>${t.problems || 0}<span>문제</span></strong><div class="bar"><i style="--value:70%"></i></div></article>
@@ -178,8 +178,8 @@ async function renderUpload() {
         <label class="mode-card ${state.uploadMode === 'auto' ? 'selected' : ''}"><input type="radio" name="upload-mode" value="auto" ${state.uploadMode === 'auto' ? 'checked' : ''}><b>자동 문제 분리</b><small>문제 번호와 문단을 자동 분석합니다. 2단 편집은 검수가 필요할 수 있습니다.</small></label>
       </div>
       <label class="drop-zone" id="drop-zone">
-        <input id="pdf-input" type="file" accept="application/pdf,.pdf">
-        <span class="upload-symbol">↥</span><h2>PDF를 이곳에 놓아주세요</h2>
+        <input id="pdf-input" type="file" accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png">
+        <span class="upload-symbol">↥</span><h2>PDF·JPG·PNG를 끌어다 놓으세요</h2>
         <p id="upload-mode-copy">${state.uploadMode === 'manual' ? '페이지를 먼저 준비한 뒤 직접 문제 영역을 그립니다.' : '문제 번호와 페이지 구조를 자동으로 분석합니다.'}<br>수식·도형·그래프는 문제별 원본과 함께 보존합니다.</p>
         <strong>파일 선택</strong><div class="upload-progress" id="upload-progress" hidden><div class="progress-line"><i style="--value:0%"></i></div><p>업로드 준비 중</p></div>
       </label>
@@ -197,10 +197,10 @@ async function renderUpload() {
     </aside></section>`;
   const input = document.querySelector('#pdf-input');
   const zone = document.querySelector('#drop-zone');
-  input.addEventListener('change', () => input.files[0] && uploadPdf(input.files[0]));
+  input.addEventListener('change', () => input.files[0] && uploadDocument(input.files[0]));
   ['dragenter','dragover'].forEach(name => zone.addEventListener(name, event => { event.preventDefault(); zone.classList.add('dragging'); }));
   ['dragleave','drop'].forEach(name => zone.addEventListener(name, event => { event.preventDefault(); zone.classList.remove('dragging'); }));
-  zone.addEventListener('drop', event => event.dataTransfer.files[0] && uploadPdf(event.dataTransfer.files[0]));
+  zone.addEventListener('drop', event => event.dataTransfer.files[0] && uploadDocument(event.dataTransfer.files[0]));
   document.querySelectorAll('input[name="upload-mode"]').forEach(radio => radio.addEventListener('change', event => {
     state.uploadMode = event.target.value;
     renderUpload();
@@ -209,8 +209,8 @@ async function renderUpload() {
   if (processing) state.pollTimer = setTimeout(() => navigate('upload', true), 2200);
 }
 
-function uploadPdf(file) {
-  if (!file.name.toLowerCase().endsWith('.pdf')) return toast('PDF 파일만 올릴 수 있습니다.', 'error');
+function uploadDocument(file) {
+  if (!/\.(pdf|jpe?g|png)$/i.test(file.name)) return toast('PDF 또는 JPG/JPEG/PNG 파일만 올릴 수 있습니다.', 'error');
   const box = document.querySelector('#upload-progress');
   const bar = box.querySelector('i');
   const text = box.querySelector('p');
@@ -221,7 +221,7 @@ function uploadPdf(file) {
     if (!event.lengthComputable) return;
     const value = Math.round(event.loaded / event.total * 100);
     bar.style.setProperty('--value', `${value}%`);
-    text.textContent = value < 100 ? `PDF 업로드 ${value}%` : '업로드 완료 · 페이지 분석을 시작합니다.';
+    text.textContent = value < 100 ? `파일 업로드 ${value}%` : '업로드 완료 · 페이지 분석을 시작합니다.';
   };
   xhr.onload = () => {
     try {
@@ -231,7 +231,7 @@ function uploadPdf(file) {
         toast('페이지를 준비하고 있습니다. 완료되면 영역 지정 화면으로 이동합니다.');
         waitForManualReady(data.document.id);
       } else {
-        toast(data.duplicate ? '이미 등록된 PDF입니다.' : 'PDF 분석을 시작했습니다.');
+        toast(data.duplicate ? '이미 등록된 파일입니다.' : '파일 분석을 시작했습니다.');
         setTimeout(() => navigate('upload', true), 600);
       }
     } catch (error) { toast(error.message, 'error'); }
@@ -468,17 +468,32 @@ async function reprocessDocument(documentId) {
   go('upload');
 }
 
+function finalProblemPreview(problem, live = false) {
+  const figures = problem.figures?.length
+    ? `<div class="final-data-figures">${problem.figures.map((path,index)=>`<img src="${esc(path)}" alt="최종 문제 도형 또는 그래프 ${index+1}">`).join('')}</div>`
+    : '';
+  return `<section class="final-data-preview">
+    <div class="final-data-head"><b>최종 데이터화 결과</b><span>본문 · 수식 · 도형 통합 미리보기</span></div>
+    <div class="final-data-paper"><div class="final-data-text math-render" ${live ? 'id="final-problem-text"' : ''}>${esc(problem.latex || problem.content)}</div>${figures}</div>
+  </section>`;
+}
+
 function reviewMarkup(problem, index, total) {
   const confidence = Math.round((problem.confidence || 0) * 100);
   const mathpixConfigured = Boolean(state.config?.providers?.mathpix?.configured);
   const ocrBanner = mathpixConfigured
     ? `<div class="ocr-banner connected"><div><b>Mathpix 연결됨</b><span>현재 문제 원본만 다시 보내 LaTeX를 개선할 수 있습니다.</span></div><button data-problem-ocr="${problem.id}">이 문제 다시 인식</button></div>`
     : `<div class="ocr-banner"><div><b>Mathpix가 연결되지 않았습니다.</b><span>현재 결과는 PDF 내장 글자에 의존하므로 수식이 깨질 수 있습니다.</span></div><button data-go="settings">API 키 설정</button></div>`;
+  const figureGallery = problem.figures?.length
+    ? `<div class="field full"><label>도형·그래프 이미지</label><div class="figure-gallery">${problem.figures.map((path,index)=>`<figure><img src="${esc(path)}" alt="도형 또는 그래프 ${index+1}"><figcaption>필기 정리 사본 · 원본은 왼쪽에 보존</figcaption></figure>`).join('')}</div></div>`
+    : `<div class="field full"><label>도형·그래프 이미지</label><div class="figure-empty">분리된 도형이 없습니다. 왼쪽 원본을 확인해 주세요.</div></div>`;
   return `${ocrBanner}<section class="review-card">
     <div class="source-pane"><div class="source-head"><b>원본 문제</b><span>${confidence}% 신뢰도</span></div>
       <div class="source-canvas">${problem.source_image ? `<img src="${esc(problem.source_image)}" alt="원본 ${esc(problem.number || '')}번 문제">` : '<p>원본 이미지를 만들지 못했습니다.</p>'}</div></div>
     <form class="editor-pane" id="review-form" data-id="${problem.id}"><div class="editor-head"><b>추출·편집 결과</b><small>${esc(problem.document_title)} · ${problem.page_start}${problem.page_end !== problem.page_start ? `–${problem.page_end}` : ''}쪽</small></div>
+      ${finalProblemPreview(problem, true)}
       <div class="form-grid">
+        ${figureGallery}
         <div class="field"><label>문제 번호</label><input name="number" value="${esc(problem.number || '')}"></div>
         <div class="field"><label>문제 유형</label><select name="problem_type"><option ${problem.problem_type==='주관식'?'selected':''}>주관식</option><option ${problem.problem_type==='객관식'?'selected':''}>객관식</option></select></div>
         <div class="field"><label>학년</label><input name="grade" value="${esc(problem.grade)}"></div>
@@ -517,7 +532,12 @@ async function renderReview() {
       const preview = document.querySelector('#math-preview');
       preview.textContent = input.value;
       preview.removeAttribute('data-katex-rendered');
-      renderMath(preview.parentElement);
+      const finalText = document.querySelector('#final-problem-text');
+      if (finalText) {
+        finalText.textContent = input.value;
+        finalText.removeAttribute('data-katex-rendered');
+      }
+      renderMath(document.querySelector('#review-form'));
     }, 180);
   });
 }
@@ -594,7 +614,7 @@ async function openProblem(id) {
   const problem = await api(`/api/problems/${id}`);
   modalContent.innerHTML = `<div class="modal-head"><h3>${esc(problem.number || problem.id)}번 문제</h3><button data-close-modal>×</button></div>
     <div class="modal-body"><div class="review-card" style="grid-template-columns:1fr 1fr;min-height:450px"><div class="source-pane"><div class="source-canvas"><img src="${esc(problem.source_image)}" alt="원본"></div></div>
-    <div class="editor-pane"><div class="math-preview math-render">${esc(problem.latex || problem.content)}</div><p style="font-size:10px;color:#69746f;line-height:1.7"><b>단원</b> ${esc(problem.unit)} · <b>개념</b> ${esc(problem.concept)} · <b>난이도</b> ${problem.difficulty}</p>
+    <div class="editor-pane">${finalProblemPreview(problem)}<p style="font-size:10px;color:#69746f;line-height:1.7"><b>단원</b> ${esc(problem.unit)} · <b>개념</b> ${esc(problem.concept)} · <b>난이도</b> ${problem.difficulty}</p>
     <p style="font-size:10px;color:#69746f"><b>정답</b> ${esc(problem.answer || '미입력')}</p><div class="math-preview">${esc(problem.solution || '해설이 아직 없습니다.')}</div></div></div></div>`;
   modal.showModal(); renderMath(modal);
 }

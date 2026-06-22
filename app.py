@@ -16,7 +16,15 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from mathbank.db import Database, now_iso
-from mathbank.extractor import extract_pdf, fingerprint, infer_metadata, similar_score
+from mathbank.extractor import (
+    extract_pdf,
+    extract_raster_figures_from_source,
+    fingerprint,
+    infer_metadata,
+    save_cleaned_figure_from_source,
+    save_image_as_pdf,
+    similar_score,
+)
 from mathbank.manual import detect_initial_regions, extract_manual_regions, normalize_regions, prepare_manual_pdf
 from mathbank.providers import MathpixProvider, ProviderError, merge_mathpix, provider_status
 
@@ -185,7 +193,7 @@ def prepare_document_regions(document_id: int, job_id: int) -> None:
         pages = prepare_manual_pdf(
             Path(document["stored_path"]), document_id, work_dir, MEDIA_ROOT, progress
         )
-        regions = detect_initial_regions(Path(document["stored_path"]), pages)
+        regions = detect_initial_regions(Path(document["stored_path"]), pages, MEDIA_ROOT)
         DB.save_document_regions(document_id, pages=pages, regions=regions, stage="ready")
         DB.execute(
             """UPDATE documents SET page_count=?, status='region_setup', provider='manual-regions',
@@ -220,6 +228,8 @@ def process_manual_document(document_id: int, job_id: int) -> None:
         work_dir = WORK_ROOT / str(document_id)
         work_dir.mkdir(parents=True, exist_ok=True)
         mathpix = configured_mathpix()
+        if not mathpix.configured:
+            raise ProviderError("문제 추출을 완료하려면 OCR 설정에서 Mathpix 키를 먼저 연결해 주세요.")
         result = extract_manual_regions(
             Path(document["stored_path"]),
             document_id,
@@ -228,13 +238,14 @@ def process_manual_document(document_id: int, job_id: int) -> None:
             work_dir,
             MEDIA_ROOT,
             mathpix=mathpix,
+            require_mathpix=True,
             progress=progress,
         )
         # OCR가 끝까지 성공한 뒤에만 기존 추출 문제를 교체한다.
         DB.execute("DELETE FROM problems WHERE document_id=?", (document_id,))
         DB.insert_problems(document_id, result["problems"])
         DB.save_document_regions(document_id, stage="extracted")
-        provider = "manual+mathpix-image" if mathpix.configured else "manual+local-text"
+        provider = "manual+mathpix-image"
         DB.execute(
             """UPDATE documents SET page_count=?, status='review', provider=?, problem_count=?,
                reviewed_count=0, coverage_percent=?, warning_count=?, error=NULL, updated_at=? WHERE id=?""",
@@ -554,6 +565,8 @@ class MathBankHandler(BaseHTTPRequestHandler):
             if match:
                 document_id = int(match.group(1))
                 body = self.read_json()
+                if not configured_mathpix().configured:
+                    return self.send_error_json("먼저 OCR 설정에서 Mathpix 키를 연결해 주세요.", 409)
                 region_data = DB.get_document_regions(document_id)
                 if not region_data:
                     return self.send_error_json("페이지 준비가 끝난 뒤 영역을 저장해 주세요.", 409)
@@ -608,9 +621,20 @@ class MathBankHandler(BaseHTTPRequestHandler):
                     return self.send_error_json("Mathpix가 인식 결과를 반환하지 않았습니다.", 422)
                 metadata = infer_metadata(recognized)
                 confidence = float(result.get("confidence", 0.86) or 0.86)
+                asset_group = source_path.parent.name or f"problem-{problem_id}"
+                sequence_match = re.search(r"(\d+)$", source_path.stem)
+                sequence = int(sequence_match.group(1)) if sequence_match else problem_id
+                figures = extract_raster_figures_from_source(
+                    source_url, MEDIA_ROOT, asset_group, sequence
+                )
+                if not figures:
+                    cleaned_figure = save_cleaned_figure_from_source(
+                        source_url, MEDIA_ROOT, asset_group, sequence
+                    )
+                    figures = [cleaned_figure] if cleaned_figure else []
                 DB.execute(
                     """UPDATE problems SET content=?, latex=?, confidence=?, unit=?, concept=?, difficulty=?,
-                       problem_type=?, tags_json=?, fingerprint=?, quality_status='needs_review',
+                       problem_type=?, tags_json=?, fingerprint=?, figures_json=?, quality_status='needs_review',
                        quality_notes=?, updated_at=? WHERE id=?""",
                     (
                         recognized,
@@ -622,6 +646,7 @@ class MathBankHandler(BaseHTTPRequestHandler):
                         metadata["problem_type"],
                         json.dumps(metadata["tags"], ensure_ascii=False),
                         fingerprint(recognized),
+                        json.dumps(figures, ensure_ascii=False),
                         "Mathpix 이미지 OCR로 다시 인식했습니다. 원본과 수식을 확인해 주세요.",
                         now_iso(),
                         problem_id,
@@ -779,14 +804,15 @@ class MathBankHandler(BaseHTTPRequestHandler):
     def upload_document(self, params: dict[str, list[str]]) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0:
-            return self.send_error_json("PDF 파일이 비어 있습니다.")
+            return self.send_error_json("업로드한 파일이 비어 있습니다.")
         if length > MAX_UPLOAD_BYTES:
             return self.send_error_json(f"파일은 {MAX_UPLOAD_BYTES // 1024 // 1024}MB까지 올릴 수 있습니다.", 413)
         filename = safe_filename((params.get("filename") or ["document.pdf"])[0])
-        if not filename.lower().endswith(".pdf"):
-            return self.send_error_json("PDF 파일만 올릴 수 있습니다.")
+        suffix = Path(filename).suffix.lower()
+        if suffix not in {".pdf", ".jpg", ".jpeg", ".png"}:
+            return self.send_error_json("PDF 또는 JPG/JPEG/PNG 파일만 올릴 수 있습니다.")
         payload = self.rfile.read(length)
-        if not payload.startswith(b"%PDF"):
+        if suffix == ".pdf" and not payload.startswith(b"%PDF"):
             return self.send_error_json("올바른 PDF 파일이 아닙니다.")
         digest = hashlib.sha256(payload).hexdigest()
         mode = (params.get("mode") or ["auto"])[0]
@@ -803,8 +829,15 @@ class MathBankHandler(BaseHTTPRequestHandler):
                 EXECUTOR.submit(prepare_document_regions, existing["id"], job_id)
                 return self.send_json({"document": existing, "job_id": job_id, "duplicate": True, "manual_preparing": True}, 202)
             return self.send_json({"document": existing, "duplicate": True}, 200)
-        stored_path = UPLOAD_ROOT / f"{digest[:16]}-{filename}"
-        stored_path.write_bytes(payload)
+        if suffix == ".pdf":
+            stored_path = UPLOAD_ROOT / f"{digest[:16]}-{filename}"
+            stored_path.write_bytes(payload)
+        else:
+            stored_path = UPLOAD_ROOT / f"{digest[:16]}-{Path(filename).stem}.pdf"
+            try:
+                save_image_as_pdf(payload, stored_path)
+            except ValueError as exc:
+                return self.send_error_json(str(exc))
         title = Path(filename).stem
         document_id = DB.create_document(title, filename, str(stored_path), digest)
         job_id = DB.create_job(document_id)

@@ -11,10 +11,12 @@ from PIL import Image
 
 from .extractor import (
     extract_figures,
+    extract_raster_figures_from_source,
     fingerprint,
     infer_metadata,
     latexize,
     render_pages,
+    save_cleaned_figure_from_source,
     save_problem_crop,
 )
 from .providers import MathpixProvider, ProviderError
@@ -64,9 +66,153 @@ def prepare_manual_pdf(
 
 
 AUTO_QUESTION_START = re.compile(r"^\s*(?:(?:문제|문항)\s*)?(?P<num>\d{1,3})\s*[\.\)\]\:：]\s*")
+AUTO_REGION_PADDING_X_RATIO = 0.01
+AUTO_REGION_PADDING_Y_RATIO = 0.04
+AUTO_REGION_MIN_VERTICAL_POINTS = 2.5
 
 
-def detect_initial_regions(pdf_path: Path, pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _item_bbox(item: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    """pdfplumber 글자·도형 객체를 위쪽 기준 좌표로 통일한다."""
+    try:
+        x0 = float(item["x0"])
+        x1 = float(item["x1"])
+        top = float(item["top"])
+        bottom = float(item["bottom"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if x1 <= x0 or bottom < top:
+        return None
+    return x0, top, x1, bottom
+
+
+def _padded_content_bounds(
+    words: list[dict[str, Any]],
+    visual_objects: list[dict[str, Any]],
+    column_x0: float,
+    column_x1: float,
+    band_top: float,
+    band_bottom: float,
+    page_width: float,
+    page_height: float,
+) -> tuple[float, float, float, float]:
+    """문제 구간 안의 실제 글자·도형 범위를 찾고 사방에 3%만 더한다."""
+    boxes: list[tuple[float, float, float, float]] = []
+    for item in [*words, *visual_objects]:
+        bbox = _item_bbox(item)
+        if not bbox:
+            continue
+        x0, top, x1, bottom = bbox
+        center_x = (x0 + x1) / 2
+        if not (column_x0 <= center_x <= column_x1):
+            continue
+        if bottom < band_top or top >= band_bottom:
+            continue
+        clipped = (
+            max(column_x0, x0),
+            max(band_top, top),
+            min(column_x1, x1),
+            min(band_bottom, bottom),
+        )
+        if clipped[2] > clipped[0] and clipped[3] >= clipped[1]:
+            boxes.append(clipped)
+
+    if not boxes:
+        return column_x0, band_top, column_x1, band_bottom
+
+    content_x0 = min(box[0] for box in boxes)
+    content_top = min(box[1] for box in boxes)
+    content_x1 = max(box[2] for box in boxes)
+    content_bottom = max(box[3] for box in boxes)
+    content_width = max(1.0, content_x1 - content_x0)
+    content_height = max(1.0, content_bottom - content_top)
+    pad_x = content_width * AUTO_REGION_PADDING_X_RATIO
+    pad_y = max(
+        AUTO_REGION_MIN_VERTICAL_POINTS,
+        content_height * AUTO_REGION_PADDING_Y_RATIO,
+    )
+    return (
+        max(0.0, column_x0, content_x0 - pad_x),
+        max(0.0, content_top - pad_y),
+        min(page_width, column_x1, content_x1 + pad_x),
+        min(page_height, band_bottom, content_bottom + pad_y),
+    )
+
+
+def _raster_ink_bounds(
+    page_image: Path,
+    column_x0: float,
+    column_x1: float,
+    band_top: float,
+    band_bottom: float,
+    page_width: float,
+    page_height: float,
+    stop_at_large_gap: bool = True,
+) -> tuple[float, float, float, float] | None:
+    """페이지 이미지에서 실제 잉크만 찾고 큰 빈 간격 뒤의 꼬리말은 제외한다."""
+    with Image.open(page_image) as source:
+        left = max(0, round(column_x0 / page_width * source.width))
+        right = min(source.width, round(column_x1 / page_width * source.width))
+        top = max(0, round(band_top / page_height * source.height))
+        bottom = min(source.height, round(band_bottom / page_height * source.height))
+        if right <= left or bottom <= top:
+            return None
+        crop = source.crop((left, top, right, bottom)).convert("L")
+        target_width = min(480, crop.width)
+        target_height = max(1, round(crop.height * target_width / max(1, crop.width)))
+        small = crop.resize((target_width, target_height))
+
+    mask = small.point(lambda value: 255 if value < 242 else 0)
+    pixels = list(mask.get_flattened_data())
+    row_threshold = max(2, round(target_width * 0.002))
+    occupied_rows = [
+        y
+        for y in range(target_height)
+        if sum(1 for value in pixels[y * target_width : (y + 1) * target_width] if value) >= row_threshold
+    ]
+    if not occupied_rows:
+        return None
+
+    # 문제 본문·보기·도형 사이의 보통 간격은 연결하되, 긴 공백 뒤의 쪽번호는 버린다.
+    scaled_page_height = source.height * target_width / max(1, crop.width)
+    gap_limit = max(10, round(scaled_page_height * 0.045))
+    first_row = occupied_rows[0]
+    last_row = first_row
+    for row in occupied_rows[1:]:
+        if stop_at_large_gap and row - last_row > gap_limit:
+            break
+        last_row = row
+
+    relevant = mask.crop((0, first_row, target_width, last_row + 1))
+    bbox = relevant.getbbox()
+    if not bbox:
+        return None
+    ink_left, _, ink_right, _ = bbox
+    scale_x = (right - left) / target_width
+    scale_y = (bottom - top) / target_height
+    content_x0 = left + ink_left * scale_x
+    content_x1 = left + ink_right * scale_x
+    content_top = top + first_row * scale_y
+    content_bottom = top + (last_row + 1) * scale_y
+    content_width = max(1.0, content_x1 - content_x0)
+    content_height = max(1.0, content_bottom - content_top)
+    pad_x = content_width * AUTO_REGION_PADDING_X_RATIO
+    pad_y = max(
+        source.height / page_height * AUTO_REGION_MIN_VERTICAL_POINTS,
+        content_height * AUTO_REGION_PADDING_Y_RATIO,
+    )
+    return (
+        max(column_x0, (content_x0 - pad_x) / source.width * page_width),
+        max(0.0, (content_top - pad_y) / source.height * page_height),
+        min(column_x1, (content_x1 + pad_x) / source.width * page_width),
+        min(band_bottom, (content_bottom + pad_y) / source.height * page_height),
+    )
+
+
+def detect_initial_regions(
+    pdf_path: Path,
+    pages: list[dict[str, Any]],
+    media_root: Path | None = None,
+) -> list[dict[str, Any]]:
     """PDF 내장 글자에서 문제 번호를 찾아 편집 가능한 초기 박스를 만든다.
 
     선택지의 ① 같은 원문자는 문제 시작으로 취급하지 않는다. 좌우 절반에
@@ -82,6 +228,12 @@ def detect_initial_regions(pdf_path: Path, pages: list[dict[str, Any]]) -> list[
             page_width = float(pdf_page.width)
             page_height = float(pdf_page.height)
             words = pdf_page.extract_words(x_tolerance=2, y_tolerance=3, keep_blank_chars=False) or []
+            visual_objects = [
+                item
+                for collection in (pdf_page.rects, pdf_page.lines, pdf_page.curves, pdf_page.images)
+                for item in (collection or [])
+                if _item_bbox(item)
+            ]
             starts: list[dict[str, Any]] = []
             for word in words:
                 match = AUTO_QUESTION_START.match(str(word.get("text", "")))
@@ -90,6 +242,32 @@ def detect_initial_regions(pdf_path: Path, pages: list[dict[str, Any]]) -> list[
                 if match and at_question_margin:
                     starts.append({**word, "number": match.group("num")})
             if not starts:
+                if media_root:
+                    page_image = media_root / str(page_info["url"]).removeprefix("/media/")
+                    raster_bounds = _raster_ink_bounds(
+                        page_image,
+                        0.0,
+                        page_width,
+                        0.0,
+                        page_height,
+                        page_width,
+                        page_height,
+                        stop_at_large_gap=False,
+                    ) if page_image.exists() else None
+                    if raster_bounds:
+                        x0, top, x1, bottom = raster_bounds
+                        detected.append(
+                            {
+                                "page": page_number,
+                                "number": str(page_number),
+                                "x": round(x0 / page_width, 6),
+                                "y": round(top / page_height, 6),
+                                "width": round((x1 - x0) / page_width, 6),
+                                "height": round((bottom - top) / page_height, 6),
+                                "order": len(detected) + 1,
+                                "source": "auto-image",
+                            }
+                        )
                 continue
 
             has_left = any(float(item["x0"]) < page_width * 0.42 for item in starts)
@@ -106,14 +284,41 @@ def detect_initial_regions(pdf_path: Path, pages: list[dict[str, Any]]) -> list[
                 ordered = sorted(column_starts, key=lambda item: float(item["top"]))
                 for index, item in enumerate(ordered):
                     if column == "left":
-                        x0, x1 = 0.01 * page_width, 0.495 * page_width
+                        column_x0, column_x1 = 0.0, 0.5 * page_width
                     elif column == "right":
-                        x0, x1 = 0.495 * page_width, 0.99 * page_width
+                        column_x0, column_x1 = 0.5 * page_width, page_width
                     else:
-                        x0, x1 = 0.01 * page_width, 0.99 * page_width
-                    top = max(0.0, float(item["top"]) - 7.0)
-                    next_top = float(ordered[index + 1]["top"]) - 5.0 if index + 1 < len(ordered) else page_height * 0.985
-                    bottom = max(top + 14.0, min(page_height, next_top))
+                        column_x0, column_x1 = 0.0, page_width
+                    band_top = max(0.0, float(item["top"]))
+                    band_bottom = (
+                        float(ordered[index + 1]["top"])
+                        if index + 1 < len(ordered)
+                        else page_height
+                    )
+                    raster_bounds = None
+                    if media_root:
+                        page_image = media_root / str(page_info["url"]).removeprefix("/media/")
+                        if page_image.exists():
+                            raster_bounds = _raster_ink_bounds(
+                                page_image,
+                                column_x0,
+                                column_x1,
+                                band_top,
+                                band_bottom,
+                                page_width,
+                                page_height,
+                            )
+                    x0, top, x1, bottom = raster_bounds or _padded_content_bounds(
+                        words,
+                        visual_objects,
+                        column_x0,
+                        column_x1,
+                        band_top,
+                        band_bottom,
+                        page_width,
+                        page_height,
+                    )
+                    bottom = max(top + 14.0, bottom)
                     detected.append(
                         {
                             "page": page_number,
@@ -173,7 +378,7 @@ def _crop_region_image(
     page_image: Path,
     region: dict[str, Any],
     destination: Path,
-    padding_ratio: float = 0.004,
+    padding_ratio: float = 0.0,
 ) -> Path:
     with Image.open(page_image) as image:
         x0 = max(0, int((region["x"] - padding_ratio) * image.width))
@@ -199,6 +404,7 @@ def extract_manual_regions(
     work_dir: Path,
     media_root: Path,
     mathpix: MathpixProvider | None = None,
+    require_mathpix: bool = False,
     progress: Callable[[int, str], None] | None = None,
 ) -> dict[str, Any]:
     """사용자가 그린 영역을 문제 경계로 확정하고 영역별로 OCR한다."""
@@ -220,6 +426,8 @@ def extract_manual_regions(
 
     problems: list[dict[str, Any]] = []
     mathpix_enabled = bool(mathpix and mathpix.configured)
+    if require_mathpix and not mathpix_enabled:
+        raise ProviderError("문제 추출을 완료하려면 OCR 설정에서 Mathpix 키를 먼저 연결해 주세요.")
     with pdfplumber.open(pdf_path) as pdf:
         pdf_pages = list(pdf.pages)
         for sequence, grouped_regions in enumerate(groups.values(), 1):
@@ -253,6 +461,8 @@ def extract_manual_regions(
                             mathpix_parts.append(recognized)
                         confidences.append(float(result.get("confidence", 0.85) or 0.85))
                     except ProviderError as exc:
+                        if require_mathpix:
+                            raise
                         notes.append(str(exc))
                 _notify(
                     progress,
@@ -266,9 +476,16 @@ def extract_manual_regions(
             figures = extract_figures(candidate, pdf_pages, page_image_paths, media_root, asset_group, sequence)
             if not figures and source_image:
                 # 스캔 PDF나 평면화된 그래프는 PDF 객체로 분리할 수 없다.
-                # 이 경우에도 시각 자료가 사라지지 않도록 문제 원본을 보존한다.
-                figures = [source_image]
-                notes.append("분리할 수 없는 도형·그래프를 문제 원본 이미지로 보존했습니다.")
+                # 원본은 그대로 두고 필기 흔적을 정리한 사본을 도형 이미지로 사용한다.
+                figures = extract_raster_figures_from_source(
+                    source_image, media_root, asset_group, sequence
+                )
+                if not figures:
+                    cleaned_figure = save_cleaned_figure_from_source(
+                        source_image, media_root, asset_group, sequence
+                    )
+                    figures = [cleaned_figure] if cleaned_figure else [source_image]
+                notes.append("도형·그래프 사본에서 색 필기와 옅은 연필 흔적을 정리했습니다.")
             if mathpix_parts:
                 latex = "\n\n".join(mathpix_parts)
                 content = _plain_from_mathpix(latex)

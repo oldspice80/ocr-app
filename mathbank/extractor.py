@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import math
 import os
 import re
 import shutil
 import subprocess
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import pdfplumber
-from PIL import Image, ImageChops, ImageOps
+from PIL import Image, ImageChops, ImageFilter, ImageOps
 
 
 QUESTION_START = re.compile(
@@ -19,6 +20,26 @@ QUESTION_START = re.compile(
 )
 
 CIRCLED_TO_NUMBER = {char: str(index) for index, char in enumerate("①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳", 1)}
+
+
+def save_image_as_pdf(payload: bytes, destination: Path) -> None:
+    """업로드된 JPEG/PNG를 방향·투명도까지 반영한 1페이지 PDF로 저장한다."""
+    try:
+        with Image.open(io.BytesIO(payload)) as source:
+            if source.format not in {"JPEG", "PNG"}:
+                raise ValueError("지원하는 이미지 형식이 아닙니다.")
+            oriented = ImageOps.exif_transpose(source)
+            if oriented.mode in {"RGBA", "LA"} or "transparency" in oriented.info:
+                rgba = oriented.convert("RGBA")
+                background = Image.new("RGBA", rgba.size, "white")
+                background.alpha_composite(rgba)
+                image = background.convert("RGB")
+            else:
+                image = oriented.convert("RGB")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            image.save(destination, "PDF", resolution=300.0)
+    except Exception as exc:
+        raise ValueError("올바른 JPG/JPEG/PNG 이미지가 아닙니다.") from exc
 
 UNIT_RULES = {
     "함수": ("함수", "그래프", "f(", "g("),
@@ -254,6 +275,129 @@ def trim_vertical_white(image: Image.Image, border: int = 12) -> Image.Image:
     return image.crop((0, top, image.width, bottom))
 
 
+def clean_figure_image(image: Image.Image) -> Image.Image:
+    """검은 인쇄선은 남기고 색 필기·옅은 연필·배경 얼룩을 제거한다."""
+    rgb = image.convert("RGB")
+    red, green, blue = rgb.split()
+    maximum = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+    minimum = ImageChops.darker(ImageChops.darker(red, green), blue)
+    saturation = ImageChops.subtract(maximum, minimum)
+    colored_marks = saturation.point(lambda value: 255 if value >= 28 else 0)
+
+    grayscale = ImageOps.grayscale(rgb)
+    # 인쇄된 검정 선·문자는 유지하고 옅은 연필과 회색 배경은 흰색으로 정리한다.
+    printed_ink = grayscale.point(lambda value: 0 if value < 178 else 255)
+    cleaned = Image.composite(Image.new("L", rgb.size, 255), printed_ink, colored_marks)
+    return cleaned.convert("RGB")
+
+
+def save_cleaned_figure_from_source(
+    source_url: str,
+    media_root: Path,
+    asset_group: str,
+    sequence: int,
+) -> str:
+    """원본 문제는 보존하고 필기만 정리한 도형용 사본을 만든다."""
+    source_path = media_root / source_url.removeprefix("/media/")
+    if not source_url or not source_path.is_file():
+        return ""
+    with Image.open(source_path) as source:
+        cleaned = trim_white(clean_figure_image(source), border=10)
+    relative = Path("figures") / asset_group / f"problem-{sequence:04d}-clean.webp"
+    destination = media_root / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    cleaned.save(destination, "WEBP", quality=94, method=6)
+    return "/media/" + relative.as_posix()
+
+
+def detect_raster_figure_boxes(image: Image.Image) -> list[tuple[int, int, int, int]]:
+    """Find large connected diagrams in a scanned problem while ignoring text rows."""
+    original_width, original_height = image.size
+    if original_width < 40 or original_height < 40:
+        return []
+    scale = min(1.0, 900 / max(original_width, original_height))
+    working = image.convert("L")
+    if scale < 1:
+        working = working.resize(
+            (max(1, round(original_width * scale)), max(1, round(original_height * scale))),
+            Image.Resampling.BILINEAR,
+        )
+    ink = working.point(lambda value: 255 if value < 185 else 0).filter(ImageFilter.MaxFilter(5))
+    width, height = ink.size
+    pixels = ink.load()
+    visited = bytearray(width * height)
+    candidates: list[tuple[int, int, int, int]] = []
+    for y in range(height):
+        for x in range(width):
+            offset = y * width + x
+            if visited[offset] or not pixels[x, y]:
+                continue
+            visited[offset] = 1
+            queue = deque([(x, y)])
+            left = right = x
+            top = bottom = y
+            count = 0
+            while queue:
+                current_x, current_y = queue.popleft()
+                count += 1
+                left, right = min(left, current_x), max(right, current_x)
+                top, bottom = min(top, current_y), max(bottom, current_y)
+                for next_x, next_y in (
+                    (current_x - 1, current_y), (current_x + 1, current_y),
+                    (current_x, current_y - 1), (current_x, current_y + 1),
+                ):
+                    if next_x < 0 or next_y < 0 or next_x >= width or next_y >= height:
+                        continue
+                    next_offset = next_y * width + next_x
+                    if visited[next_offset] or not pixels[next_x, next_y]:
+                        continue
+                    visited[next_offset] = 1
+                    queue.append((next_x, next_y))
+            box_width, box_height = right - left + 1, bottom - top + 1
+            if (
+                box_width >= width * 0.16
+                and box_height >= height * 0.13
+                and count >= max(120, int(width * height * 0.0015))
+            ):
+                candidates.append((left, top, right + 1, bottom + 1))
+
+    inverse_scale = 1 / scale
+    margin_x = max(12, round(original_width * 0.035))
+    margin_y = max(12, round(original_height * 0.035))
+    boxes = []
+    for left, top, right, bottom in cluster_boxes(candidates):
+        boxes.append((
+            max(0, round(left * inverse_scale) - margin_x),
+            max(0, round(top * inverse_scale) - margin_y),
+            min(original_width, round(right * inverse_scale) + margin_x),
+            min(original_height, round(bottom * inverse_scale) + margin_y),
+        ))
+    return boxes[:4]
+
+
+def extract_raster_figures_from_source(
+    source_url: str,
+    media_root: Path,
+    asset_group: str,
+    sequence: int,
+) -> list[str]:
+    """Crop diagrams from a JPG/PNG/scanned problem source and save clean copies."""
+    source_path = media_root / source_url.removeprefix("/media/")
+    if not source_url or not source_path.is_file():
+        return []
+    saved: list[str] = []
+    with Image.open(source_path) as source:
+        source_rgb = source.convert("RGB")
+        for index, box in enumerate(detect_raster_figure_boxes(source_rgb), 1):
+            crop = trim_white(clean_figure_image(source_rgb.crop(box)), border=8)
+            relative = Path("figures") / asset_group / f"problem-{sequence:04d}-raster-{index:02d}.webp"
+            destination = media_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            crop.save(destination, "WEBP", quality=94, method=6)
+            saved.append("/media/" + relative.as_posix())
+    return saved
+
+
 def save_problem_crop(
     problem: dict[str, Any],
     page_images: list[Path],
@@ -374,7 +518,7 @@ def extract_figures(
                 "x1": min(segment["page_width"], bbox[2] + 12),
                 "bottom": min(segment["bottom"], bbox[3] + 18),
             }
-            crop = trim_white(crop_segment(image, figure_segment, padding_points=3), border=8)
+            crop = trim_white(clean_figure_image(crop_segment(image, figure_segment, padding_points=3)), border=8)
             relative = Path("figures") / str(document_id) / f"problem-{sequence:04d}-{figure_index:02d}.webp"
             destination = media_root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -517,6 +661,15 @@ def extract_pdf(
             metadata = infer_metadata(text)
             source_image = save_problem_crop(candidate, page_images, media_root, document_id, sequence)
             figures = extract_figures(candidate, page_objects, page_images, media_root, document_id, sequence)
+            if not figures and source_image:
+                figures = extract_raster_figures_from_source(
+                    source_image, media_root, str(document_id), sequence
+                )
+                if not figures:
+                    cleaned_figure = save_cleaned_figure_from_source(
+                        source_image, media_root, str(document_id), sequence
+                    )
+                    figures = [cleaned_figure] if cleaned_figure else []
             notes: list[str] = []
             confidence = 0.78
             if candidate.get("needs_number_review") or not candidate.get("number"):

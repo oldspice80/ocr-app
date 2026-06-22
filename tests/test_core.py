@@ -13,7 +13,13 @@ from reportlab.lib.utils import ImageReader
 from PIL import Image, ImageDraw
 
 from mathbank.db import Database
-from mathbank.extractor import extract_pdf, similar_score
+from mathbank.extractor import (
+    clean_figure_image,
+    detect_raster_figure_boxes,
+    extract_pdf,
+    save_image_as_pdf,
+    similar_score,
+)
 from mathbank.manual import detect_initial_regions, extract_manual_regions, prepare_manual_pdf
 from mathbank.providers import MathpixProvider
 
@@ -60,6 +66,53 @@ def make_two_column_pdf(path: Path) -> None:
 
 
 class ExtractorTests(unittest.TestCase):
+    def test_raster_diagram_is_separated_from_text_rows(self):
+        image = Image.new("RGB", (600, 800), "white")
+        draw = ImageDraw.Draw(image)
+        for y in (40, 75, 110, 145):
+            draw.text((30, y), "A short mathematics problem line", fill="black")
+        draw.ellipse((180, 260, 480, 610), outline="black", width=5)
+        draw.line((210, 560, 445, 315), fill="black", width=5)
+        boxes = detect_raster_figure_boxes(image)
+        self.assertTrue(boxes)
+        left, top, right, bottom = boxes[0]
+        self.assertGreater(top, 180)
+        self.assertGreater(right - left, 250)
+        self.assertGreater(bottom - top, 300)
+
+    def test_figure_cleanup_removes_colored_and_faint_marks(self):
+        image = Image.new("RGB", (120, 80), "white")
+        draw = ImageDraw.Draw(image)
+        draw.line((10, 20, 110, 20), fill="black", width=3)
+        draw.line((10, 40, 110, 40), fill=(255, 0, 0), width=3)
+        draw.line((10, 60, 110, 60), fill=(205, 205, 205), width=3)
+        cleaned = clean_figure_image(image)
+        self.assertLess(cleaned.getpixel((60, 20))[0], 20)
+        self.assertGreater(cleaned.getpixel((60, 40))[0], 240)
+        self.assertGreater(cleaned.getpixel((60, 60))[0], 240)
+
+    def test_jpeg_upload_is_converted_to_one_page_pdf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "problem.jpg"
+            pdf_path = root / "problem.pdf"
+            Image.new("RGB", (640, 480), "white").save(image_path, "JPEG")
+            save_image_as_pdf(image_path.read_bytes(), pdf_path)
+            result = extract_pdf(pdf_path, 7, root / "work", root / "media")
+            self.assertEqual(result["page_count"], 1)
+
+    def test_transparent_png_upload_is_converted_to_one_page_pdf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "capture.png"
+            pdf_path = root / "capture.pdf"
+            image = Image.new("RGBA", (640, 480), (255, 255, 255, 0))
+            ImageDraw.Draw(image).text((40, 40), "1. x + 1 = 2", fill=(0, 0, 0, 255))
+            image.save(image_path, "PNG")
+            save_image_as_pdf(image_path.read_bytes(), pdf_path)
+            result = extract_pdf(pdf_path, 8, root / "work", root / "media")
+            self.assertEqual(result["page_count"], 1)
+
     def test_extracts_numbered_problems_and_images(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -98,10 +151,14 @@ class ExtractorTests(unittest.TestCase):
             pdf_path = root / "columns.pdf"
             make_two_column_pdf(pdf_path)
             pages = prepare_manual_pdf(pdf_path, 3, root / "work", root / "media")
-            detected = detect_initial_regions(pdf_path, pages)
+            detected = detect_initial_regions(pdf_path, pages, root / "media")
             self.assertEqual([item["number"] for item in detected], ["1", "2"])
             self.assertLess(detected[0]["x"], 0.1)
             self.assertGreater(detected[1]["x"], 0.45)
+            self.assertLess(detected[0]["width"], 0.4)
+            self.assertLess(detected[1]["width"], 0.4)
+            self.assertLess(detected[0]["height"], 0.2)
+            self.assertLess(detected[1]["height"], 0.35)
             regions = [
                 {"page": 1, "number": "1", "x": 0.02, "y": 0.04, "width": 0.46, "height": 0.32, "order": 1},
                 {"page": 1, "number": "2", "x": 0.50, "y": 0.04, "width": 0.48, "height": 0.36, "order": 2},
@@ -113,6 +170,32 @@ class ExtractorTests(unittest.TestCase):
             self.assertIn("Solve", result["problems"][0]["content"])
             self.assertNotIn("square", result["problems"][0]["content"])
             self.assertIn("square", result["problems"][1]["content"])
+
+    def test_manual_region_extraction_completes_with_mathpix_latex(self):
+        class FakeMathpix:
+            configured = True
+
+            def process_image(self, _image_path):
+                return {"text": r"\(x+3=8\)", "confidence": 0.97}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf_path = root / "columns.pdf"
+            make_two_column_pdf(pdf_path)
+            pages = prepare_manual_pdf(pdf_path, 4, root / "work", root / "media")
+            regions = detect_initial_regions(pdf_path, pages, root / "media")
+            result = extract_manual_regions(
+                pdf_path,
+                4,
+                pages,
+                [regions[0]],
+                root / "work",
+                root / "media",
+                mathpix=FakeMathpix(),
+                require_mathpix=True,
+            )
+            self.assertEqual(result["problems"][0]["latex"], r"\(x+3=8\)")
+            self.assertGreater(result["problems"][0]["confidence"], 0.9)
 
 
 class DatabaseTests(unittest.TestCase):
