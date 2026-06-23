@@ -14,12 +14,26 @@ from typing import Any, Callable, Iterable
 import pdfplumber
 from PIL import Image, ImageChops, ImageFilter, ImageOps
 
+from .box_blocks import extract_raster_box_blocks, extract_vector_box_blocks
+from .latex_text import latexize_plain_numbers
+
 
 QUESTION_START = re.compile(
     r"^\s*(?:(?:문제|문항)\s*)?(?P<num>\d{1,3})\s*[\.\)\]\:：]\s*|^\s*(?P<circled>[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳])\s*"
 )
 
 CIRCLED_TO_NUMBER = {char: str(index) for index, char in enumerate("①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳", 1)}
+
+LEADING_PROBLEM_NUMBER = re.compile(
+    r"^\s*(?:[#>*-]+\s*)?(?:(?:문제|문항)\s*)?"
+    r"(?:(?:\d{1,3})\s*(?:번\s*[\.\)\]\:：]?|[\.\)\]\:：])|"
+    r"[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]\s*[\.\)\]\:：]?)\s*"
+)
+
+
+def strip_problem_number(text: str) -> str:
+    """Remove only a leading printed question number from OCR text."""
+    return LEADING_PROBLEM_NUMBER.sub("", str(text or ""), count=1).lstrip()
 
 
 def save_image_as_pdf(payload: bytes, destination: Path) -> None:
@@ -380,6 +394,7 @@ def extract_raster_figures_from_source(
     media_root: Path,
     asset_group: str,
     sequence: int,
+    exclude_regions: list[dict[str, float]] | None = None,
 ) -> list[str]:
     """Crop diagrams from a JPG/PNG/scanned problem source and save clean copies."""
     source_path = media_root / source_url.removeprefix("/media/")
@@ -388,9 +403,28 @@ def extract_raster_figures_from_source(
     saved: list[str] = []
     with Image.open(source_path) as source:
         source_rgb = source.convert("RGB")
-        for index, box in enumerate(detect_raster_figure_boxes(source_rgb), 1):
+        figure_index = 0
+        for box in detect_raster_figure_boxes(source_rgb):
+            box_area = max(1, (box[2] - box[0]) * (box[3] - box[1]))
+            overlaps_box_content = False
+            for region in exclude_regions or []:
+                excluded = (
+                    round(float(region.get("x", 0)) * source_rgb.width),
+                    round(float(region.get("y", 0)) * source_rgb.height),
+                    round((float(region.get("x", 0)) + float(region.get("width", 0))) * source_rgb.width),
+                    round((float(region.get("y", 0)) + float(region.get("height", 0))) * source_rgb.height),
+                )
+                intersection = max(0, min(box[2], excluded[2]) - max(box[0], excluded[0])) * max(
+                    0, min(box[3], excluded[3]) - max(box[1], excluded[1])
+                )
+                if intersection / box_area >= 0.55:
+                    overlaps_box_content = True
+                    break
+            if overlaps_box_content:
+                continue
+            figure_index += 1
             crop = trim_white(clean_figure_image(source_rgb.crop(box)), border=8)
-            relative = Path("figures") / asset_group / f"problem-{sequence:04d}-raster-{index:02d}.webp"
+            relative = Path("figures") / asset_group / f"problem-{sequence:04d}-raster-{figure_index:02d}.webp"
             destination = media_root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             crop.save(destination, "WEBP", quality=94, method=6)
@@ -487,12 +521,16 @@ def extract_figures(
     media_root: Path,
     document_id: int,
     sequence: int,
+    exclude_regions: list[dict[str, float]] | None = None,
 ) -> list[str]:
     figures: list[str] = []
     figure_index = 0
     for segment in problem["segments"]:
         page_index = segment["page"] - 1
         page = pdf_pages[page_index]
+        segment_width = max(1.0, float(segment["x1"]) - float(segment["x0"]))
+        segment_height = max(1.0, float(segment["bottom"]) - float(segment["top"]))
+        segment_area = segment_width * segment_height
         candidates: list[tuple[float, float, float, float]] = []
         for item in list(page.images) + list(page.curves) + list(page.rects) + list(page.lines):
             bbox = _object_bbox(item, float(page.height))
@@ -504,10 +542,29 @@ def extract_figures(
             width, height = x1 - x0, bottom - top
             if width < 2 and height < 2:
                 continue
+            # A scanned PDF commonly exposes the entire page (or entire problem
+            # segment) as one image object.  Treating that object as a figure
+            # duplicates the question text and choices inside the figure crop.
+            clipped_width = min(x1, float(segment["x1"])) - max(x0, float(segment["x0"]))
+            clipped_height = min(bottom, float(segment["bottom"])) - max(top, float(segment["top"]))
+            if (
+                clipped_width / segment_width >= 0.88
+                and clipped_height / segment_height >= 0.72
+            ) or (max(0.0, clipped_width) * max(0.0, clipped_height) / segment_area >= 0.75):
+                continue
             candidates.append((x0, max(top, segment["top"]), x1, min(bottom, segment["bottom"])))
         for bbox in cluster_boxes(candidates):
             width, height = bbox[2] - bbox[0], bbox[3] - bbox[1]
             if width < 24 or height < 18 or width * height < 700:
+                continue
+            bbox_area = max(1.0, width * height)
+            if any(
+                int(region.get("page", -1)) == int(segment["page"])
+                and max(0.0, min(bbox[2], float(region["x1"])) - max(bbox[0], float(region["x0"])))
+                * max(0.0, min(bbox[3], float(region["bottom"])) - max(bbox[1], float(region["top"])))
+                / bbox_area >= 0.68
+                for region in exclude_regions or []
+            ):
                 continue
             figure_index += 1
             image = Image.open(page_images[page_index])
@@ -566,7 +623,7 @@ def latexize(text: str) -> str:
         if math_signal and korean_count == 0 and not ("$" in transformed or "\\(" in transformed):
             transformed = f"\\({transformed}\\)"
         lines.append(transformed)
-    return "\n".join(lines)
+    return latexize_plain_numbers("\n".join(lines))
 
 
 def fingerprint(text: str) -> str:
@@ -657,19 +714,45 @@ def extract_pdf(
         results: list[dict[str, Any]] = []
         page_objects = list(pdf.pages)
         for sequence, candidate in enumerate(candidates, 1):
-            text = "\n".join(candidate["texts"]).strip()
+            text = strip_problem_number("\n".join(candidate["texts"]).strip())
             metadata = infer_metadata(text)
             source_image = save_problem_crop(candidate, page_images, media_root, document_id, sequence)
-            figures = extract_figures(candidate, page_objects, page_images, media_root, document_id, sequence)
+            content_blocks = extract_vector_box_blocks(
+                candidate,
+                page_objects,
+                page_images,
+                media_root,
+                str(document_id),
+                sequence,
+                latexizer=latexize,
+            )
+            if not content_blocks and source_image:
+                content_blocks = extract_raster_box_blocks(
+                    source_image,
+                    media_root,
+                    str(document_id),
+                    sequence,
+                    latexizer=latexize,
+                    figure_detector=detect_raster_figure_boxes,
+                    figure_cleaner=clean_figure_image,
+                )
+            figures = extract_figures(
+                candidate,
+                page_objects,
+                page_images,
+                media_root,
+                document_id,
+                sequence,
+                exclude_regions=[block["page_region"] for block in content_blocks if block.get("page_region")],
+            )
             if not figures and source_image:
                 figures = extract_raster_figures_from_source(
-                    source_image, media_root, str(document_id), sequence
+                    source_image,
+                    media_root,
+                    str(document_id),
+                    sequence,
+                    exclude_regions=[block["region"] for block in content_blocks if block.get("region")],
                 )
-                if not figures:
-                    cleaned_figure = save_cleaned_figure_from_source(
-                        source_image, media_root, str(document_id), sequence
-                    )
-                    figures = [cleaned_figure] if cleaned_figure else []
             notes: list[str] = []
             confidence = 0.78
             if candidate.get("needs_number_review") or not candidate.get("number"):
@@ -691,6 +774,7 @@ def extract_pdf(
                     "latex": latexize(text),
                     "source_image": source_image,
                     "figures": figures,
+                    "content_blocks": content_blocks,
                     "segments": candidate["segments"],
                     "confidence": round(max(0.05, min(0.98, confidence)), 2),
                     "quality_status": "needs_review",

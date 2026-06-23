@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .latex_text import latexize_plain_numbers
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -64,6 +66,7 @@ CREATE TABLE IF NOT EXISTS problems (
     confidence REAL NOT NULL DEFAULT 0,
     source_image TEXT NOT NULL DEFAULT '',
     figures_json TEXT NOT NULL DEFAULT '[]',
+    content_blocks_json TEXT NOT NULL DEFAULT '[]',
     segments_json TEXT NOT NULL DEFAULT '[]',
     tags_json TEXT NOT NULL DEFAULT '[]',
     fingerprint TEXT NOT NULL DEFAULT '',
@@ -127,6 +130,9 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(problems)")}
+            if "content_blocks_json" not in columns:
+                conn.execute("ALTER TABLE problems ADD COLUMN content_blocks_json TEXT NOT NULL DEFAULT '[]'")
 
     @contextmanager
     def connect(self):
@@ -228,6 +234,8 @@ class Database:
         )
 
     def insert_problems(self, document_id: int, problems: list[dict[str, Any]]) -> None:
+        from .extractor import strip_problem_number
+
         now = now_iso()
         with self.connect() as conn:
             for problem in problems:
@@ -236,16 +244,16 @@ class Database:
                         document_id, number, page_start, page_end, content, latex,
                         answer, solution, subject, grade, unit, concept, difficulty,
                         problem_type, quality_status, confidence, source_image,
-                        figures_json, segments_json, tags_json, fingerprint,
+                        figures_json, content_blocks_json, segments_json, tags_json, fingerprint,
                         quality_notes, created_at, updated_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         document_id,
                         problem.get("number"),
                         problem["page_start"],
                         problem["page_end"],
-                        problem.get("content", ""),
-                        problem.get("latex", ""),
+                        strip_problem_number(problem.get("content", "")),
+                        latexize_plain_numbers(strip_problem_number(problem.get("latex", ""))),
                         problem.get("answer", ""),
                         problem.get("solution", ""),
                         problem.get("subject", "수학"),
@@ -258,6 +266,7 @@ class Database:
                         problem.get("confidence", 0),
                         problem.get("source_image", ""),
                         json.dumps(problem.get("figures", []), ensure_ascii=False),
+                        json.dumps(problem.get("content_blocks", []), ensure_ascii=False),
                         json.dumps(problem.get("segments", []), ensure_ascii=False),
                         json.dumps(problem.get("tags", []), ensure_ascii=False),
                         problem.get("fingerprint", ""),
@@ -271,6 +280,7 @@ class Database:
     def decode_problem(row: dict[str, Any]) -> dict[str, Any]:
         for source, target in (
             ("figures_json", "figures"),
+            ("content_blocks_json", "content_blocks"),
             ("segments_json", "segments"),
             ("tags_json", "tags"),
         ):

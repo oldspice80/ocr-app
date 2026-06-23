@@ -1,3 +1,14 @@
+import {
+  deleteCloudProblem,
+  deleteCloudProblems,
+  firebaseSettingsPanel,
+  initFirebaseSync,
+  pushLocalSnapshot,
+  signInFirebase,
+  signOutFirebase,
+  syncProblem,
+} from './firebase-sync.js';
+
 const state = {
   route: location.hash.replace('#', '') || 'dashboard',
   dashboard: null,
@@ -8,6 +19,7 @@ const state = {
   pollTimer: null,
   uploadMode: 'manual',
   manual: null,
+  firebase: null,
 };
 
 const app = document.querySelector('#app');
@@ -60,7 +72,11 @@ async function api(path, options = {}) {
 function renderMath(root = document) {
   if (!window.renderMathInElement) return;
   root.querySelectorAll('.math-render').forEach(element => {
+    if (element.dataset.katexRendered === '1') return;
     try {
+      // KaTeX uses side limits for inline operators by default.  Math worksheets
+      // conventionally place a sum's lower/upper conditions below/above sigma.
+      element.textContent = element.textContent.replace(/\\sum(?!\s*\\limits)/g, '\\sum\\limits');
       renderMathInElement(element, {
         delimiters: [
           {left: '\\[', right: '\\]', display: true},
@@ -70,6 +86,7 @@ function renderMath(root = document) {
         ],
         throwOnError: false,
       });
+      element.dataset.katexRendered = '1';
     } catch (_) {}
   });
 }
@@ -258,6 +275,7 @@ async function renderSettings() {
   const mathpix = config.mathpix;
   const badgeLabel = mathpix.verified ? '연결 확인됨' : mathpix.configured ? '키 저장됨' : '연결 필요';
   app.innerHTML = `<section class="settings-layout">
+    <div class="settings-main-column">
     <article class="panel settings-card">
       <div class="settings-head"><div class="settings-logo">M</div><div><span>MATHPIX OCR</span><h2>수식 인식 연결</h2><p>문제 영역 이미지를 Mathpix로 보내 한국어 본문과 수식을 Mathpix Markdown·LaTeX로 받습니다.</p></div><span class="connection-badge ${mathpix.verified ? 'connected' : mathpix.configured ? 'saved' : ''}">${badgeLabel}</span></div>
       <form id="mathpix-settings-form">
@@ -267,6 +285,8 @@ async function renderSettings() {
         <div class="settings-actions"><button type="button" class="danger-btn" id="clear-mathpix" ${mathpix.configured ? '' : 'disabled'}>연결 해제</button>${mathpix.configured ? '<button type="button" class="soft-btn" id="test-mathpix">저장된 키 다시 확인</button>' : ''}<button type="submit" class="primary-btn" id="save-mathpix">키 저장 및 실제 OCR 확인</button></div>
       </form>
     </article>
+    ${firebaseSettingsPanel()}
+    </div>
     <aside class="panel settings-help"><h3>정확도를 높이는 사용 순서</h3>
       <ol><li><b>키를 연결합니다.</b><span>사용량 조회가 제한된 계정은 실제 OCR 인증으로 다시 확인합니다.</span></li><li><b>자동 감지 박스를 확인합니다.</b><span>박스를 이동하거나 모서리를 끌어 문제 전체를 감싸세요.</span></li><li><b>영역별 OCR을 실행합니다.</b><span>전체 페이지가 아닌 문제 한 개씩 전송해 LaTeX 대응이 선명해집니다.</span></li></ol>
       <p class="cost-note">영역별 인식은 그린 영역 하나마다 Mathpix 이미지 OCR 요청이 1회 발생하며, 사용량은 Mathpix 계정 요금에 반영될 수 있습니다.</p>
@@ -468,13 +488,157 @@ async function reprocessDocument(documentId) {
   go('upload');
 }
 
-function finalProblemPreview(problem, live = false) {
+function blockTypeLabel(type) {
+  return type === 'table_block' ? '수식 표' : type === 'choice_box' ? '객관식 선택지 박스' : type === 'example_box' ? '보기·예시 박스' : '조건 박스';
+}
+
+function finalBlockMarkup(block, index, live = false) {
+  const structured = block.display_mode === 'structured' && (block.latex || block.content);
+  const elements = [...(block.elements || [])].sort((a,b)=>Number(a.order||0)-Number(b.order||0));
+  const structuredBody = elements.length
+    ? elements.map((element,elementIndex)=>element.type==='figure'
+      ? `<img src="${esc(element.source || '')}" alt="박스 내부 도형">`
+      : `<div class="content-block-text math-render" ${live && elementIndex===0 ? `id="final-block-${index}"` : ''}>${esc(element.latex || element.content || '')}</div>`).join('')
+    : `<div class="content-block-text math-render" ${live ? `id="final-block-${index}"` : ''}>${esc(block.latex || block.content)}</div>${(block.figures || []).map(path=>`<img src="${esc(path)}" alt="박스 내부 도형">`).join('')}`;
+  const body = structured ? structuredBody : `<img class="content-block-fallback" src="${esc(block.source_image || '')}" alt="OCR 신뢰도가 낮은 박스 원본">`;
+  const region = block.region || {};
+  const side = Number(region.x) >= 0.52 && Number(region.width) <= 0.46;
+  const width = side ? Math.max(26,Math.min(46,Number(region.width || 0.34)*100)) : 100;
+  return `<section class="content-block-output ${esc(block.type || 'condition_box')} ${side?'side-content-block':''}" style="--content-block-width:${width}%" aria-label="${blockTypeLabel(block.type)}">${body}</section>`;
+}
+
+function contentBlocksEditor(problem) {
+  const blocks = problem.content_blocks || [];
+  if (!blocks.length) return '';
+  return `<section class="field full block-editor-section"><label>조건·보기 박스 구조화 데이터</label>${blocks.map((block,index)=>{
+    const confidence = Math.round(Number(block.confidence || 0) * 100);
+    const region = block.region || {x:0,y:0,width:1,height:1};
+    return `<article class="block-editor" data-block-index="${index}">
+      <div class="block-editor-head"><b>${blockTypeLabel(block.type)}</b><span class="${block.display_mode==='structured'?'ok':'low'}">OCR ${confidence}% · ${block.display_mode==='structured'?'구조화 출력':'원본 대체 표시'}</span></div>
+      <div class="field"><label>박스 내부 일반 텍스트</label><textarea data-block-content="${index}">${esc(block.content || '')}</textarea></div>
+      <div class="field"><label>박스 내부 LaTeX</label><textarea data-block-latex="${index}">${esc(block.latex || '')}</textarea></div>
+      <div class="block-actions"><button type="button" data-block-ocr="${index}">OCR 다시 실행</button><button type="button" data-block-region-toggle="${index}">박스 내부 영역 다시 지정</button></div>
+      <div class="block-region-editor" data-block-region-editor="${index}" hidden>
+        <label>왼쪽 %<input type="number" min="0" max="98" step="0.1" data-region-x value="${(region.x*100).toFixed(1)}"></label>
+        <label>위 %<input type="number" min="0" max="98" step="0.1" data-region-y value="${(region.y*100).toFixed(1)}"></label>
+        <label>너비 %<input type="number" min="2" max="100" step="0.1" data-region-width value="${(region.width*100).toFixed(1)}"></label>
+        <label>높이 %<input type="number" min="2" max="100" step="0.1" data-region-height value="${(region.height*100).toFixed(1)}"></label>
+        <button type="button" class="soft-btn" data-block-region-save="${index}">새 영역 저장 후 OCR</button>
+      </div>
+      <details class="block-compare"><summary>원본 이미지와 추출 결과 비교</summary><div><img src="${esc(block.source_image || '')}" alt="박스 원본">${finalBlockMarkup(block,index)}</div></details>
+    </article>`;
+  }).join('')}</section>`;
+}
+
+function normalizedTextMap(value) {
+  let text = '';
+  const positions = [];
+  for (let index=0; index<value.length; index++) {
+    if (/\s/.test(value[index]) || '\\{}()[]'.includes(value[index])) continue;
+    text += value[index];
+    positions.push(index);
+  }
+  return {text,positions};
+}
+
+function approximateBlockPosition(text, block, index, total, useTop = false) {
+  const region = block.region || {};
+  const relative = Number.isFinite(Number(region.y))
+    ? Math.max(0,Math.min(1,Number(region.y) + (useTop ? 0 : Number(region.height || 0) / 2)))
+    : (index + 1) / (total + 1);
+  const target = Math.round(text.length * relative);
+  const radius = Math.max(20,Math.round(text.length * 0.16));
+  const start = Math.max(0,target-radius);
+  const end = Math.min(text.length,target+radius);
+  const boundaries = [];
+  for (let cursor=start; cursor<end; cursor++) {
+    if (text[cursor] === '\n' || /[.?!。]\s/.test(text.slice(cursor,cursor+2))) boundaries.push(cursor+1);
+  }
+  if (!boundaries.length) return target;
+  return boundaries.reduce((best,value)=>Math.abs(value-target)<Math.abs(best-target)?value:best,boundaries[0]);
+}
+
+function locateBlockInProblem(problemText, block) {
+  // Plain/raw box content is the best placement key. Display LaTeX may be
+  // normalized (for example tabular -> array) and intentionally differ.
+  const needle = block.content || block.latex || '';
+  if (!needle.trim()) return null;
+  const exact = problemText.indexOf(needle);
+  if (exact >= 0) return {start:exact,end:exact+needle.length};
+  const sourceMap = normalizedTextMap(problemText);
+  const needleMap = normalizedTextMap(needle);
+  if (!needleMap.text) return null;
+  const normalizedIndex = sourceMap.text.indexOf(needleMap.text);
+  if (normalizedIndex >= 0) {
+    const start = sourceMap.positions[normalizedIndex];
+    const endPosition = sourceMap.positions[normalizedIndex + needleMap.text.length - 1];
+    return {start,end:endPosition+1};
+  }
+
+  // Full-problem OCR and isolated-box OCR can differ by a few characters.
+  // Matching stable anchors at both ends prevents the same paragraph from
+  // remaining outside while also being rendered inside its condition box.
+  if (needleMap.text.length < 24) return null;
+  const anchorLength = Math.min(20,Math.max(12,Math.floor(needleMap.text.length*0.16)));
+  const prefix = needleMap.text.slice(0,anchorLength);
+  const suffix = needleMap.text.slice(-anchorLength);
+  const prefixIndex = sourceMap.text.indexOf(prefix);
+  if (prefixIndex < 0) return null;
+  const suffixStart = Math.max(prefixIndex+anchorLength,prefixIndex+needleMap.text.length-anchorLength*3);
+  const suffixIndex = sourceMap.text.indexOf(suffix,suffixStart);
+  if (suffixIndex < 0 || suffixIndex-prefixIndex > needleMap.text.length+anchorLength*4) return null;
+  const start = sourceMap.positions[prefixIndex];
+  const endPosition = sourceMap.positions[suffixIndex+suffix.length-1];
+  return {start,end:endPosition+1};
+}
+
+function integratedProblemBody(problem, live = false) {
+  const text = problem.latex || problem.content || '';
+  const blocks = [...(problem.content_blocks || [])].sort((a,b)=>Number(a.order||0)-Number(b.order||0));
   const figures = problem.figures?.length
     ? `<div class="final-data-figures">${problem.figures.map((path,index)=>`<img src="${esc(path)}" alt="최종 문제 도형 또는 그래프 ${index+1}">`).join('')}</div>`
     : '';
+  if (!blocks.length) {
+    return `<div class="final-data-text math-render" ${live ? 'id="final-problem-text"' : ''}>${esc(text)}</div>${figures}`;
+  }
+
+  const located = blocks.map((block,index)=>({
+    block,index,
+    location:block.display_mode==='structured' ? locateBlockInProblem(text,block) : null,
+  }));
+  const ranges = located.filter(item=>item.location).map(item=>item.location).sort((a,b)=>a.start-b.start);
+  let cleanText = text;
+  [...ranges].sort((a,b)=>b.start-a.start).forEach(range => {
+    cleanText = cleanText.slice(0,range.start) + cleanText.slice(range.end);
+  });
+  const removedBefore = position => ranges.reduce((total,range)=>total+(range.end<=position?range.end-range.start:0),0);
+  const placements = located.map(item=>{
+    const region = item.block.region || {};
+    const side = Number(region.x)>=0.52 && Number(region.width)<=0.46;
+    const start = side
+      ? approximateBlockPosition(cleanText,item.block,item.index,blocks.length,true)
+      : item.location
+        ? item.location.start-removedBefore(item.location.start)
+        : approximateBlockPosition(cleanText,item.block,item.index,blocks.length);
+    return {...item,start};
+  });
+  placements.sort((a,b)=>a.start-b.start);
+  let cursor = 0;
+  let markup = '';
+  placements.forEach(item => {
+    item.start = Math.max(cursor,item.start);
+    markup += `<div class="final-data-text math-render">${esc(cleanText.slice(cursor,item.start))}</div>`;
+    markup += finalBlockMarkup(item.block,item.index,live);
+    cursor = item.start;
+  });
+  markup += `<div class="final-data-text math-render" ${live ? 'id="final-problem-text"' : ''}>${esc(cleanText.slice(cursor))}</div>${figures}`;
+  return `<div class="integrated-problem-flow">${markup}</div>`;
+}
+
+function finalProblemPreview(problem, live = false) {
   return `<section class="final-data-preview">
     <div class="final-data-head"><b>최종 데이터화 결과</b><span>본문 · 수식 · 도형 통합 미리보기</span></div>
-    <div class="final-data-paper"><div class="final-data-text math-render" ${live ? 'id="final-problem-text"' : ''}>${esc(problem.latex || problem.content)}</div>${figures}</div>
+    <div class="final-data-paper">${integratedProblemBody(problem,live)}</div>
   </section>`;
 }
 
@@ -494,6 +658,7 @@ function reviewMarkup(problem, index, total) {
       ${finalProblemPreview(problem, true)}
       <div class="form-grid">
         ${figureGallery}
+        ${contentBlocksEditor(problem)}
         <div class="field"><label>문제 번호</label><input name="number" value="${esc(problem.number || '')}"></div>
         <div class="field"><label>문제 유형</label><select name="problem_type"><option ${problem.problem_type==='주관식'?'selected':''}>주관식</option><option ${problem.problem_type==='객관식'?'selected':''}>객관식</option></select></div>
         <div class="field"><label>학년</label><input name="grade" value="${esc(problem.grade)}"></div>
@@ -532,13 +697,23 @@ async function renderReview() {
       const preview = document.querySelector('#math-preview');
       preview.textContent = input.value;
       preview.removeAttribute('data-katex-rendered');
-      const finalText = document.querySelector('#final-problem-text');
-      if (finalText) {
-        finalText.textContent = input.value;
-        finalText.removeAttribute('data-katex-rendered');
-      }
+      const paper = document.querySelector('.final-data-paper');
+      const current = state.problems[state.reviewIndex];
+      if (paper && current) paper.innerHTML = integratedProblemBody({...current,latex:input.value},true);
       renderMath(document.querySelector('#review-form'));
     }, 180);
+  });
+  document.querySelector('#review-form')?.addEventListener('input', event => {
+    const blockLatex = event.target.closest('[data-block-latex]');
+    if (!blockLatex) return;
+    const current = state.problems[state.reviewIndex];
+    const paper = document.querySelector('.final-data-paper');
+    if (!current || !paper) return;
+    const blocks = (current.content_blocks || []).map((block,index)=>index===Number(blockLatex.dataset.blockLatex)
+      ? {...block,latex:blockLatex.value,content:document.querySelector(`[data-block-content="${index}"]`)?.value || block.content,display_mode:'structured'}
+      : block);
+    paper.innerHTML = integratedProblemBody({...current,content_blocks:blocks},true);
+    renderMath(paper);
   });
 }
 
@@ -561,13 +736,31 @@ function reviewFormData(status) {
   const form = document.querySelector('#review-form');
   const fields = Object.fromEntries(new FormData(form).entries());
   fields.difficulty = Number(fields.difficulty);
+  const current = state.problems[state.reviewIndex];
+  fields.content_blocks = (current.content_blocks || []).map((block,index) => {
+    const content = form.querySelector(`[data-block-content="${index}"]`)?.value ?? block.content ?? '';
+    const latex = form.querySelector(`[data-block-latex="${index}"]`)?.value ?? block.latex ?? '';
+    const confidence = content.trim() || latex.trim() ? Math.max(Number(block.confidence || 0), 0.9) : Number(block.confidence || 0);
+    return {...block, content, latex, confidence, display_mode:(content.trim()||latex.trim())?'structured':'image_fallback', elements:[
+      ...(content.trim()||latex.trim() ? [{type:'text_math',content,latex,order:1}] : []),
+      ...(block.figures || []).map((source,figureIndex)=>({type:'figure',source,order:figureIndex+2})),
+    ]};
+  });
   if (status && status !== 'save') fields.quality_status = status;
   return {id: Number(form.dataset.id), fields};
 }
 
+async function rerunBlockOcr(problemId, blockIndex, region = null) {
+  const path = `/api/problems/${problemId}/blocks/${blockIndex}/${region ? 'region' : 'ocr'}`;
+  await api(path, {method:'POST', body:JSON.stringify(region ? {region} : {})});
+  toast(region ? '새 박스 영역으로 OCR을 다시 실행했습니다.' : '박스 내부 OCR을 다시 실행했습니다.');
+  await navigate('review', true);
+}
+
 async function saveReview(status) {
   const {id, fields} = reviewFormData(status);
-  await api(`/api/problems/${id}`, {method:'PATCH', body:JSON.stringify(fields)});
+  const updated = await api(`/api/problems/${id}`, {method:'PATCH', body:JSON.stringify(fields)});
+  syncProblem(updated).catch(() => {});
   toast(status === 'approved' ? '검수 승인했습니다.' : status === 'rejected' ? '문제은행에서 제외했습니다.' : '수정 내용을 저장했습니다.');
   if (status === 'approved' || status === 'rejected') {
     state.problems.splice(state.reviewIndex, 1);
@@ -632,6 +825,7 @@ async function deleteProblem(id) {
   const label = problem?.number ? `${problem.number}번 문제` : '이 문제';
   if (!confirm(`${label}를 완전히 삭제할까요?\n삭제한 문제는 복구할 수 없습니다.`)) return;
   await api(`/api/problems/${id}`, {method:'DELETE'});
+  deleteCloudProblem(id).catch(() => {});
   setSelected(id, false);
   state.problems = state.problems.filter(item => Number(item.id) !== Number(id));
   if (modal.open) modal.close();
@@ -649,6 +843,7 @@ async function deleteSelectedProblems() {
   if (!ids.length) return toast('삭제할 문제를 먼저 선택해 주세요.', 'error');
   if (!confirm(`선택한 ${ids.length}문제를 모두 삭제할까요?\n삭제한 문제는 복구할 수 없습니다.`)) return;
   const result = await api('/api/problems', {method:'DELETE', body:JSON.stringify({problem_ids:ids})});
+  deleteCloudProblems(result.deleted_ids).catch(() => {});
   for (const id of result.deleted_ids) state.selected.delete(Number(id));
   localStorage.setItem('mathbank-selected', JSON.stringify([...state.selected]));
   toast(`${result.deleted_count}문제를 삭제했습니다.`);
@@ -694,6 +889,31 @@ document.addEventListener('click', async event => {
     if (confirm('저장된 Mathpix 연결 정보를 지울까요?')) clearMathpixSettings().catch(error => toast(error.message,'error'));
     return;
   }
+  if (event.target.closest('#firebase-signin')) {
+    return signInFirebase()
+      .then(() => { toast('Firebase에 로그인했습니다.'); return navigate('settings', true); })
+      .catch(error => toast(error.message, 'error'));
+  }
+  if (event.target.closest('#firebase-signout')) {
+    return signOutFirebase()
+      .then(() => { toast('Firebase에서 로그아웃했습니다.'); return navigate('settings', true); })
+      .catch(error => toast(error.message, 'error'));
+  }
+  if (event.target.closest('#firebase-push-local')) {
+    const button = event.target.closest('#firebase-push-local');
+    button.disabled = true;
+    button.textContent = 'Firebase에 올리는 중…';
+    return pushLocalSnapshot(api)
+      .then(snapshot => {
+        toast(`문제 ${snapshot.problems?.length || 0}개를 Firebase에 올렸습니다.`);
+        return navigate('settings', true);
+      })
+      .catch(error => {
+        toast(error.message, 'error');
+        button.disabled = false;
+        button.textContent = '현재 데이터 Firebase에 올리기';
+      });
+  }
   const openRegions = event.target.closest('[data-open-regions]');
   if (openRegions) return go(`regions:${openRegions.dataset.openRegions}`);
   const prepareRegions = event.target.closest('[data-prepare-regions]');
@@ -702,6 +922,28 @@ document.addEventListener('click', async event => {
   if (reprocess) return reprocessDocument(reprocess.dataset.reprocessDocument).catch(error => toast(error.message,'error'));
   const problemOcr = event.target.closest('[data-problem-ocr]');
   if (problemOcr) return rerunProblemOcr(Number(problemOcr.dataset.problemOcr));
+  const blockRegionToggle = event.target.closest('[data-block-region-toggle]');
+  if (blockRegionToggle) {
+    const editor = document.querySelector(`[data-block-region-editor="${blockRegionToggle.dataset.blockRegionToggle}"]`);
+    if (editor) editor.hidden = !editor.hidden;
+    return;
+  }
+  const blockOcr = event.target.closest('[data-block-ocr]');
+  if (blockOcr) {
+    const problemId = Number(document.querySelector('#review-form')?.dataset.id);
+    blockOcr.disabled = true;
+    return rerunBlockOcr(problemId, Number(blockOcr.dataset.blockOcr)).catch(error => { toast(error.message,'error'); blockOcr.disabled=false; });
+  }
+  const blockRegionSave = event.target.closest('[data-block-region-save]');
+  if (blockRegionSave) {
+    const index = Number(blockRegionSave.dataset.blockRegionSave);
+    const editor = document.querySelector(`[data-block-region-editor="${index}"]`);
+    const value = name => Number(editor.querySelector(`[data-region-${name}]`).value) / 100;
+    const region = {x:value('x'),y:value('y'),width:value('width'),height:value('height')};
+    const problemId = Number(document.querySelector('#review-form')?.dataset.id);
+    blockRegionSave.disabled = true;
+    return rerunBlockOcr(problemId,index,region).catch(error=>{toast(error.message,'error');blockRegionSave.disabled=false;});
+  }
   const deleteProblemButton = event.target.closest('[data-delete-problem]');
   if (deleteProblemButton) return deleteProblem(Number(deleteProblemButton.dataset.deleteProblem)).catch(error => toast(error.message,'error'));
   if (event.target.closest('[data-delete-selected-problems]')) return deleteSelectedProblems().catch(error => toast(error.message,'error'));
@@ -747,4 +989,16 @@ document.addEventListener('click', async event => {
 
 window.addEventListener('hashchange', () => navigate(location.hash.replace('#','') || 'dashboard', true));
 modal.addEventListener('click', event => { if (event.target === modal) modal.close(); });
+initFirebaseSync({
+  onStatusChange: detail => {
+    state.firebase = detail;
+    if (state.route === 'settings' && app.dataset.ready === 'true') {
+      document.querySelector('.firebase-card')?.replaceWith(
+        document.createRange().createContextualFragment(firebaseSettingsPanel()).firstElementChild
+      );
+    }
+  },
+}).catch(error => {
+  state.firebase = {error:error.message};
+});
 navigate(state.route, true);

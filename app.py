@@ -15,17 +15,24 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from PIL import Image
+
+from mathbank.box_blocks import BOX_CONFIDENCE_THRESHOLD, extract_raster_box_blocks
 from mathbank.db import Database, now_iso
 from mathbank.extractor import (
+    clean_figure_image,
+    detect_raster_figure_boxes,
     extract_pdf,
     extract_raster_figures_from_source,
     fingerprint,
     infer_metadata,
-    save_cleaned_figure_from_source,
+    latexize,
     save_image_as_pdf,
     similar_score,
+    strip_problem_number,
 )
 from mathbank.manual import detect_initial_regions, extract_manual_regions, normalize_regions, prepare_manual_pdf
+from mathbank.latex_text import latexize_plain_numbers
 from mathbank.providers import MathpixProvider, ProviderError, merge_mathpix, provider_status
 
 
@@ -293,6 +300,32 @@ def dashboard_payload() -> dict:
     return {"totals": totals, "documents": documents, "units": units}
 
 
+def sync_export_payload() -> dict:
+    documents = DB.all("SELECT * FROM documents ORDER BY id")
+    problems = [DB.decode_problem(row) for row in DB.all(
+        """SELECT p.*, d.title AS document_title
+           FROM problems p JOIN documents d ON d.id=p.document_id
+           ORDER BY p.id"""
+    )]
+    exams = DB.all(
+        """SELECT e.*, COUNT(ei.id) AS item_count, COALESCE(SUM(ei.points),0) AS total_points
+           FROM exams e LEFT JOIN exam_items ei ON ei.exam_id=e.id
+           GROUP BY e.id ORDER BY e.id"""
+    )
+    for exam in exams:
+        items = DB.all(
+            "SELECT problem_id, position, points FROM exam_items WHERE exam_id=? ORDER BY position",
+            (exam["id"],),
+        )
+        exam["items"] = items
+    return {
+        "exported_at": now_iso(),
+        "documents": documents,
+        "problems": problems,
+        "exams": exams,
+    }
+
+
 def list_problems(params: dict[str, list[str]]) -> list[dict]:
     clauses = ["1=1"]
     values: list[object] = []
@@ -337,19 +370,110 @@ def exam_payload(exam_id: int) -> dict | None:
     return exam
 
 
+def structured_problem_html(item: dict) -> str | None:
+    text = str(item.get("latex") or item.get("content") or "")
+    blocks = sorted(item.get("content_blocks", []), key=lambda value: value.get("order", 0))
+    if not blocks:
+        return f'<div class="math-content">{html.escape(text)}</div>'
+
+    def normalized_map(value: str) -> tuple[str, list[int]]:
+        compact, positions = [], []
+        for index, character in enumerate(value):
+            if character.isspace() or character in "\\{}()[]":
+                continue
+            compact.append(character)
+            positions.append(index)
+        return "".join(compact), positions
+
+    source_compact, source_positions = normalized_map(text)
+    placements: list[tuple[int, int, bool, dict]] = []
+    for block_index, block in enumerate(blocks):
+        needle = str(block.get("content") or block.get("latex") or "")
+        start = text.find(needle) if block.get("display_mode") == "structured" and needle.strip() else -1
+        replaces_text = start >= 0
+        if replaces_text:
+            end = start + len(needle)
+        elif block.get("display_mode") == "structured" and needle.strip():
+            needle_compact, _ = normalized_map(needle)
+            compact_index = source_compact.find(needle_compact)
+            if compact_index >= 0 and needle_compact:
+                start = source_positions[compact_index]
+                end = source_positions[compact_index + len(needle_compact) - 1] + 1
+                replaces_text = True
+            elif len(needle_compact) >= 24:
+                # The isolated box OCR can contain a couple of character errors
+                # compared with the full-problem OCR. Match stable anchors at
+                # both ends so print output does not duplicate the paragraph.
+                anchor_length = min(20, max(12, int(len(needle_compact) * 0.16)))
+                prefix = needle_compact[:anchor_length]
+                suffix = needle_compact[-anchor_length:]
+                prefix_index = source_compact.find(prefix)
+                suffix_start = max(
+                    prefix_index + anchor_length,
+                    prefix_index + len(needle_compact) - anchor_length * 3,
+                )
+                suffix_index = source_compact.find(suffix, suffix_start) if prefix_index >= 0 else -1
+                if (
+                    prefix_index >= 0
+                    and suffix_index >= 0
+                    and suffix_index - prefix_index <= len(needle_compact) + anchor_length * 4
+                ):
+                    start = source_positions[prefix_index]
+                    end = source_positions[suffix_index + len(suffix) - 1] + 1
+                    replaces_text = True
+        if not replaces_text:
+            region = block.get("region") or {}
+            relative = float(region.get("y", (block_index + 1) / (len(blocks) + 1))) + float(region.get("height", 0)) / 2
+            start = max(0, min(len(text), round(len(text) * max(0.0, min(1.0, relative)))))
+            search_start = max(0, start - max(20, round(len(text) * 0.16)))
+            search_end = min(len(text), start + max(20, round(len(text) * 0.16)))
+            boundaries = [
+                index + 1 for index in range(search_start, search_end)
+                if text[index] == "\n" or text[index] in ".?!。"
+            ]
+            if boundaries:
+                start = min(boundaries, key=lambda value: abs(value - start))
+            end = start
+        placements.append((start, end, replaces_text, block))
+    placements.sort(key=lambda value: value[0])
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end, replaces_text, block in placements:
+        if start < cursor:
+            start = end = cursor
+            replaces_text = False
+        parts.append(f'<div class="math-content">{html.escape(text[cursor:start])}</div>')
+        if block.get("display_mode") == "structured" and (block.get("latex") or block.get("content")):
+            block_body = f'<div class="math-content">{html.escape(block.get("latex") or block.get("content") or "")}</div>'
+            block_body += "".join(
+                f'<img class="figure" src="{html.escape(path)}" alt="박스 내부 도형">'
+                for path in block.get("figures", [])
+            )
+        else:
+            block_body = f'<img class="box-source" src="{html.escape(block.get("source_image", ""))}" alt="OCR 확인이 필요한 박스 원본">'
+        parts.append(f'<div class="content-box {html.escape(block.get("type", "condition_box"))}">{block_body}</div>')
+        cursor = end if replaces_text else start
+    parts.append(f'<div class="math-content">{html.escape(text[cursor:])}</div>')
+    return "".join(parts)
+
+
 def print_exam_html(exam: dict, mode: str = "original", answers: bool = False) -> str:
     items_html: list[str] = []
     for index, item in enumerate(exam["items"], 1):
         points = int(item.get("points", 5))
         if mode == "edited":
-            body = f'<div class="math-content">{html.escape(item.get("latex") or item.get("content") or "")}</div>'
+            body = structured_problem_html(item)
+            if body is None:
+                body = f'<img class="source" src="{html.escape(item.get("source_image", ""))}" alt="{index}번 문제">'
             figures = "".join(
                 f'<img class="figure" src="{html.escape(path)}" alt="문제 도형">'
                 for path in item.get("figures", [])
             )
             if not figures and item.get("source_image"):
                 figures = f'<details><summary>원본 확인</summary><img class="source-mini" src="{html.escape(item["source_image"])}" alt="원본 문제"></details>'
-            body += figures
+            if structured_problem_html(item) is not None:
+                body += figures
         else:
             body = f'<img class="source" src="{html.escape(item.get("source_image", ""))}" alt="{index}번 문제">'
         answer = ""
@@ -379,6 +503,9 @@ h1 {{ font-size:20pt; margin:0 0 5px; letter-spacing:-.04em; }}
 .source {{ display:block; width:100%; max-height:690px; object-fit:contain; object-position:left top; }}
 .source-mini {{ width:100%; margin-top:6px; }}
 .figure {{ display:block; max-width:84%; max-height:260px; margin:10px auto; }}
+.content-box {{ margin:10px 0; padding:10px 12px; border:1px solid #222; break-inside:avoid; }}
+.content-box.table_block {{ padding:0; border:0; background:transparent; }}
+.box-source {{ display:block; width:100%; max-height:260px; object-fit:contain; }}
 .math-content {{ white-space:pre-wrap; line-height:1.75; }}
 .answer {{ margin-top:12px; border-top:1px dashed #aaa; padding-top:8px; line-height:1.6; color:#333; }}
 details {{ color:#777; font-size:8pt; margin-top:10px; }}
@@ -390,7 +517,7 @@ details {{ color:#777; font-size:8pt; margin-top:10px; }}
 <header class="paper-head"><h1>{html.escape(exam['title'])}</h1><div class="meta"><span>{html.escape(exam.get('subtitle',''))}</span><span>시험 시간 {int(exam.get('duration',50))}분</span></div></header>
 <div class="student"><span>학년·반</span><span>이름</span></div><main class="sheet">{''.join(items_html)}</main>
 <script src="/vendor/katex/katex.min.js"></script><script src="/vendor/katex/contrib/auto-render.min.js"></script>
-<script>document.addEventListener('DOMContentLoaded',()=>{{document.querySelectorAll('.math-content').forEach(el=>renderMathInElement(el,{{delimiters:[{{left:'\\\\(',right:'\\\\)',display:false}},{{left:'\\\\[',right:'\\\\]',display:true}},{{left:'$',right:'$',display:false}}],throwOnError:false}}));}});</script>
+<script>document.addEventListener('DOMContentLoaded',()=>{{document.querySelectorAll('.math-content').forEach(el=>{{el.textContent=el.textContent.replace(/\\\\sum(?!\\s*\\\\limits)/g,'\\\\sum\\\\limits');renderMathInElement(el,{{delimiters:[{{left:'\\\\(',right:'\\\\)',display:false}},{{left:'\\\\[',right:'\\\\]',display:true}},{{left:'$',right:'$',display:false}}],throwOnError:false}});}});}});</script>
 </body></html>"""
 
 
@@ -435,6 +562,8 @@ class MathBankHandler(BaseHTTPRequestHandler):
                 return self.send_json({**config, "max_upload_mb": MAX_UPLOAD_BYTES // 1024 // 1024})
             if path == "/api/settings/ocr":
                 return self.send_json(ocr_config_payload())
+            if path == "/api/sync/export":
+                return self.send_json(sync_export_payload())
             if path == "/api/dashboard":
                 return self.send_json(dashboard_payload())
             if path == "/api/documents":
@@ -616,7 +745,7 @@ class MathBankHandler(BaseHTTPRequestHandler):
                 if not source_path.is_file():
                     return self.send_error_json("문제 원본 이미지를 찾지 못했습니다.", 404)
                 result = provider.process_image(source_path)
-                recognized = str(result.get("text") or result.get("latex_styled") or "").strip()
+                recognized = latexize_plain_numbers(strip_problem_number(str(result.get("text") or result.get("latex_styled") or "").strip()))
                 if not recognized:
                     return self.send_error_json("Mathpix가 인식 결과를 반환하지 않았습니다.", 422)
                 metadata = infer_metadata(recognized)
@@ -624,17 +753,26 @@ class MathBankHandler(BaseHTTPRequestHandler):
                 asset_group = source_path.parent.name or f"problem-{problem_id}"
                 sequence_match = re.search(r"(\d+)$", source_path.stem)
                 sequence = int(sequence_match.group(1)) if sequence_match else problem_id
-                figures = extract_raster_figures_from_source(
-                    source_url, MEDIA_ROOT, asset_group, sequence
+                content_blocks = extract_raster_box_blocks(
+                    source_url,
+                    MEDIA_ROOT,
+                    asset_group,
+                    sequence,
+                    mathpix=provider,
+                    latexizer=latexize,
+                    figure_detector=detect_raster_figure_boxes,
+                    figure_cleaner=clean_figure_image,
                 )
-                if not figures:
-                    cleaned_figure = save_cleaned_figure_from_source(
-                        source_url, MEDIA_ROOT, asset_group, sequence
-                    )
-                    figures = [cleaned_figure] if cleaned_figure else []
+                figures = extract_raster_figures_from_source(
+                    source_url,
+                    MEDIA_ROOT,
+                    asset_group,
+                    sequence,
+                    exclude_regions=[block["region"] for block in content_blocks if block.get("region")],
+                )
                 DB.execute(
                     """UPDATE problems SET content=?, latex=?, confidence=?, unit=?, concept=?, difficulty=?,
-                       problem_type=?, tags_json=?, fingerprint=?, figures_json=?, quality_status='needs_review',
+                       problem_type=?, tags_json=?, fingerprint=?, figures_json=?, content_blocks_json=?, quality_status='needs_review',
                        quality_notes=?, updated_at=? WHERE id=?""",
                     (
                         recognized,
@@ -647,6 +785,7 @@ class MathBankHandler(BaseHTTPRequestHandler):
                         json.dumps(metadata["tags"], ensure_ascii=False),
                         fingerprint(recognized),
                         json.dumps(figures, ensure_ascii=False),
+                        json.dumps(content_blocks, ensure_ascii=False),
                         "Mathpix 이미지 OCR로 다시 인식했습니다. 원본과 수식을 확인해 주세요.",
                         now_iso(),
                         problem_id,
@@ -654,6 +793,78 @@ class MathBankHandler(BaseHTTPRequestHandler):
                 )
                 updated = DB.one("SELECT * FROM problems WHERE id=?", (problem_id,))
                 return self.send_json(DB.decode_problem(updated))
+            match = re.fullmatch(r"/api/problems/(\d+)/blocks/(\d+)/(ocr|region)", path)
+            if match:
+                problem_id = int(match.group(1))
+                block_index = int(match.group(2))
+                action = match.group(3)
+                row = DB.one("SELECT * FROM problems WHERE id=?", (problem_id,))
+                if not row:
+                    return self.send_error_json("문제를 찾지 못했습니다.", 404)
+                problem = DB.decode_problem(row)
+                blocks = list(problem.get("content_blocks") or [])
+                if block_index < 0 or block_index >= len(blocks):
+                    return self.send_error_json("박스 콘텐츠를 찾지 못했습니다.", 404)
+                block = dict(blocks[block_index])
+                provider = configured_mathpix()
+                if not provider.configured:
+                    return self.send_error_json("박스 OCR을 다시 실행하려면 Mathpix 키를 연결해 주세요.", 409)
+
+                if action == "region":
+                    body = self.read_json()
+                    region = body.get("region") or {}
+                    x = max(0.0, min(1.0, float(region.get("x", 0))))
+                    y = max(0.0, min(1.0, float(region.get("y", 0))))
+                    width = max(0.02, min(1.0 - x, float(region.get("width", 1 - x))))
+                    height = max(0.02, min(1.0 - y, float(region.get("height", 1 - y))))
+                    source_url = str(problem.get("source_image") or "")
+                    source_path = (MEDIA_ROOT / source_url.removeprefix("/media/")).resolve()
+                    try:
+                        source_path.relative_to(MEDIA_ROOT.resolve())
+                    except ValueError:
+                        return self.send_error_json("문제 원본 경로가 올바르지 않습니다.", 400)
+                    if not source_path.is_file():
+                        return self.send_error_json("문제 원본 이미지를 찾지 못했습니다.", 404)
+                    relative = Path("boxes") / "adjusted" / f"problem-{problem_id}-box-{block_index + 1}.webp"
+                    destination = MEDIA_ROOT / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with Image.open(source_path) as source:
+                        crop_box = (
+                            round(x * source.width), round(y * source.height),
+                            round((x + width) * source.width), round((y + height) * source.height),
+                        )
+                        source.crop(crop_box).convert("RGB").save(destination, "WEBP", quality=95, method=6)
+                    block["source_image"] = "/media/" + relative.as_posix()
+                    block["region"] = {"x": x, "y": y, "width": width, "height": height}
+
+                block_source = (MEDIA_ROOT / str(block.get("source_image") or "").removeprefix("/media/")).resolve()
+                try:
+                    block_source.relative_to(MEDIA_ROOT.resolve())
+                except ValueError:
+                    return self.send_error_json("박스 원본 경로가 올바르지 않습니다.", 400)
+                if not block_source.is_file():
+                    return self.send_error_json("박스 원본 이미지를 찾지 못했습니다.", 404)
+                result = provider.process_image(block_source)
+                recognized = str(result.get("text") or result.get("latex_styled") or "").strip()
+                confidence = float(result.get("confidence", 0.82) or 0.82)
+                block["content"] = recognized
+                block["latex"] = recognized
+                block["confidence"] = round(confidence, 2)
+                block["display_mode"] = (
+                    "structured" if recognized and confidence >= BOX_CONFIDENCE_THRESHOLD else "image_fallback"
+                )
+                block["elements"] = ([{
+                    "type": "text_math", "content": recognized, "latex": recognized, "order": 1,
+                }] if recognized else []) + [
+                    {"type": "figure", "source": figure, "order": index + 2}
+                    for index, figure in enumerate(block.get("figures") or [])
+                ]
+                blocks[block_index] = block
+                DB.execute(
+                    "UPDATE problems SET content_blocks_json=?, quality_status='needs_review', updated_at=? WHERE id=?",
+                    (json.dumps(blocks, ensure_ascii=False), now_iso(), problem_id),
+                )
+                return self.send_json({"block": block, "content_blocks": blocks})
             if path == "/api/exams":
                 body = self.read_json()
                 title = str(body.get("title", "")).strip() or "새 시험지"
@@ -705,6 +916,8 @@ class MathBankHandler(BaseHTTPRequestHandler):
                 "unit", "concept", "difficulty", "problem_type", "quality_status", "quality_notes",
             }
             updates = {key: value for key, value in body.items() if key in allowed}
+            if "content_blocks" in body:
+                updates["content_blocks_json"] = json.dumps(body["content_blocks"], ensure_ascii=False)
             if not updates:
                 return self.send_error_json("수정할 내용이 없습니다.")
             if "quality_status" in updates and updates["quality_status"] not in {"needs_review", "approved", "rejected"}:

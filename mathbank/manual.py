@@ -9,17 +9,21 @@ from typing import Any, Callable
 import pdfplumber
 from PIL import Image
 
+from .box_blocks import extract_raster_box_blocks, extract_vector_box_blocks
 from .extractor import (
+    clean_figure_image,
+    detect_raster_figure_boxes,
     extract_figures,
     extract_raster_figures_from_source,
     fingerprint,
     infer_metadata,
     latexize,
     render_pages,
-    save_cleaned_figure_from_source,
     save_problem_crop,
+    strip_problem_number,
 )
 from .providers import MathpixProvider, ProviderError
+from .latex_text import latexize_plain_numbers
 
 
 def _notify(callback: Callable[[int, str], None] | None, value: int, message: str) -> None:
@@ -473,26 +477,64 @@ def extract_manual_regions(
             candidate = {"number": number, "segments": segments}
             asset_group = f"{document_id}-manual"
             source_image = save_problem_crop(candidate, page_image_paths, media_root, asset_group, sequence)
-            figures = extract_figures(candidate, pdf_pages, page_image_paths, media_root, asset_group, sequence)
-            if not figures and source_image:
-                # 스캔 PDF나 평면화된 그래프는 PDF 객체로 분리할 수 없다.
-                # 원본은 그대로 두고 필기 흔적을 정리한 사본을 도형 이미지로 사용한다.
-                figures = extract_raster_figures_from_source(
-                    source_image, media_root, asset_group, sequence
-                )
-                if not figures:
-                    cleaned_figure = save_cleaned_figure_from_source(
-                        source_image, media_root, asset_group, sequence
+            content_blocks = extract_vector_box_blocks(
+                candidate,
+                pdf_pages,
+                page_image_paths,
+                media_root,
+                asset_group,
+                sequence,
+                latexizer=latexize,
+            )
+            if not content_blocks and source_image:
+                try:
+                    content_blocks = extract_raster_box_blocks(
+                        source_image,
+                        media_root,
+                        asset_group,
+                        sequence,
+                        mathpix=mathpix if mathpix_enabled else None,
+                        latexizer=latexize,
+                        figure_detector=detect_raster_figure_boxes,
+                        figure_cleaner=clean_figure_image,
                     )
-                    figures = [cleaned_figure] if cleaned_figure else [source_image]
-                notes.append("도형·그래프 사본에서 색 필기와 옅은 연필 흔적을 정리했습니다.")
+                except ProviderError as exc:
+                    content_blocks = extract_raster_box_blocks(
+                        source_image,
+                        media_root,
+                        asset_group,
+                        sequence,
+                        latexizer=latexize,
+                        figure_detector=detect_raster_figure_boxes,
+                        figure_cleaner=clean_figure_image,
+                    )
+                    notes.append(f"조건·보기 박스 OCR은 원본 이미지로 보관했습니다: {exc}")
+            figures = extract_figures(
+                candidate,
+                pdf_pages,
+                page_image_paths,
+                media_root,
+                asset_group,
+                sequence,
+                exclude_regions=[block["page_region"] for block in content_blocks if block.get("page_region")],
+            )
+            if not figures and source_image:
+                figures = extract_raster_figures_from_source(
+                    source_image,
+                    media_root,
+                    asset_group,
+                    sequence,
+                    exclude_regions=[block["region"] for block in content_blocks if block.get("region")],
+                )
+            if figures:
+                notes.append("실제 도형·그래프만 분리하고 조건·보기 박스는 제외했습니다.")
             if mathpix_parts:
-                latex = "\n\n".join(mathpix_parts)
+                latex = latexize_plain_numbers(strip_problem_number("\n\n".join(mathpix_parts)))
                 content = _plain_from_mathpix(latex)
                 confidence = sum(confidences) / len(confidences) if confidences else 0.86
                 notes.append("Mathpix 영역별 수식 OCR을 적용했습니다.")
             else:
-                content = "\n".join(local_parts).strip() or "[영역 내 텍스트를 인식하지 못했습니다.]"
+                content = strip_problem_number("\n".join(local_parts).strip()) or "[영역 내 텍스트를 인식하지 못했습니다.]"
                 latex = latexize(content)
                 confidence = 0.62 if local_parts else 0.3
                 if not mathpix_enabled:
@@ -508,6 +550,7 @@ def extract_manual_regions(
                     "latex": latex,
                     "source_image": source_image,
                     "figures": figures,
+                    "content_blocks": content_blocks,
                     "segments": segments,
                     "confidence": round(max(0.05, min(0.99, confidence)), 2),
                     "quality_status": "needs_review",

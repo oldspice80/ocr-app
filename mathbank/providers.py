@@ -17,6 +17,7 @@ from typing import Any, Callable
 from PIL import Image, ImageDraw
 
 from .extractor import QUESTION_START, fingerprint, infer_metadata
+from .latex_text import latexize_plain_numbers
 
 
 class ProviderError(RuntimeError):
@@ -267,6 +268,8 @@ def split_mathpix_markdown(markdown: str) -> list[dict[str, Any]]:
 
 
 def merge_mathpix(problems: list[dict[str, Any]], markdown: str) -> tuple[list[dict[str, Any]], str]:
+    from .extractor import strip_problem_number
+
     chunks = split_mathpix_markdown(markdown)
     if not chunks:
         return problems, "Mathpix 결과에서 문제 경계를 찾지 못해 원본 구조만 사용했습니다."
@@ -277,8 +280,8 @@ def merge_mathpix(problems: list[dict[str, Any]], markdown: str) -> tuple[list[d
         if chunk is None and len(chunks) == len(problems):
             chunk = chunks[index]
         if chunk:
-            problem["latex"] = chunk["latex"]
-            problem["content"] = re.sub(r"\\[\(\)\[\]]|\$+", "", chunk["content"])
+            problem["latex"] = latexize_plain_numbers(strip_problem_number(chunk["latex"]))
+            problem["content"] = strip_problem_number(re.sub(r"\\[\(\)\[\]]|\$+", "", chunk["content"]))
             problem["fingerprint"] = fingerprint(problem["content"])
             metadata = infer_metadata(problem["content"])
             problem.update(metadata)

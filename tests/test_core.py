@@ -12,15 +12,20 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from PIL import Image, ImageDraw
 
+from mathbank.box_blocks import classify_box, detect_raster_box_rects, extract_raster_box_blocks, normalize_box_latex
 from mathbank.db import Database
 from mathbank.extractor import (
     clean_figure_image,
     detect_raster_figure_boxes,
     extract_pdf,
+    extract_figures,
+    extract_raster_figures_from_source,
     save_image_as_pdf,
     similar_score,
+    strip_problem_number,
 )
 from mathbank.manual import detect_initial_regions, extract_manual_regions, prepare_manual_pdf
+from mathbank.latex_text import latexize_plain_numbers
 from mathbank.providers import MathpixProvider
 
 
@@ -66,6 +71,146 @@ def make_two_column_pdf(path: Path) -> None:
 
 
 class ExtractorTests(unittest.TestCase):
+    def test_leading_problem_number_is_removed_from_ocr_text(self):
+        self.assertEqual(strip_problem_number("26. 그림과 같이 함수가 있다."), "그림과 같이 함수가 있다.")
+        self.assertEqual(strip_problem_number("문항 7) 값을 구하여라."), "값을 구하여라.")
+        self.assertEqual(strip_problem_number("① 다음 중 옳은 것은?"), "다음 중 옳은 것은?")
+        self.assertEqual(strip_problem_number("2024년 시행 문제"), "2024년 시행 문제")
+
+    def test_plain_numbers_become_latex_without_double_wrapping_math(self):
+        value = latexize_plain_numbers(r"6 이하이고 \(X=4800\)일 때 0.5와 3번")
+        self.assertEqual(value, r"\(6\) 이하이고 \(X=4800\)일 때 \(0.5\)와 \(3\)번")
+        self.assertEqual(latexize_plain_numbers(value), value)
+
+    def test_condition_box_is_detected_but_open_graph_axes_are_not(self):
+        boxed = Image.new("RGB", (600, 500), "white")
+        boxed_draw = ImageDraw.Draw(boxed)
+        boxed_draw.rectangle((80, 120, 520, 330), outline="black", width=4)
+        boxed_draw.text((110, 165), "Condition: x + y = 3", fill="black")
+        boxes = detect_raster_box_rects(boxed)
+        self.assertEqual(len(boxes), 1)
+        self.assertLess(abs(boxes[0][0] - 80), 8)
+
+        graph = Image.new("RGB", (600, 500), "white")
+        graph_draw = ImageDraw.Draw(graph)
+        graph_draw.line((100, 400, 520, 400), fill="black", width=4)
+        graph_draw.line((100, 400, 100, 80), fill="black", width=4)
+        graph_draw.line((100, 350, 450, 120), fill="black", width=4)
+        self.assertEqual(detect_raster_box_rects(graph), [])
+
+    def test_separate_boxes_do_not_create_cross_spanning_duplicates(self):
+        image = Image.new("RGB", (600, 900), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((60, 80, 540, 260), outline="black", width=4)
+        draw.rectangle((60, 390, 540, 780), outline="black", width=4)
+        boxes = detect_raster_box_rects(image)
+        self.assertEqual(len(boxes), 2)
+        self.assertLess(boxes[0][3], boxes[1][1])
+
+    def test_ruled_normal_distribution_table_is_one_outer_box(self):
+        image = Image.new("RGB", (420, 420), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((250, 120, 390, 360), outline="black", width=2)
+        draw.line((300, 120, 300, 360), fill="black", width=2)
+        for y in range(150, 361, 30):
+            draw.line((250, y, 390, y), fill="black", width=2)
+        boxes = detect_raster_box_rects(image)
+        self.assertEqual(len(boxes), 1)
+        left, top, right, bottom = boxes[0]
+        self.assertLessEqual(left, 252)
+        self.assertLessEqual(top, 122)
+        self.assertGreaterEqual(right, 389)
+        self.assertGreaterEqual(bottom, 359)
+
+    def test_math_table_is_latex_not_an_internal_figure(self):
+        class FakeTableMathpix:
+            configured = True
+
+            def process_image(self, _path):
+                table = r"\begin{tabular}{|c|c|}\hline \(z\)&\(P(0\le Z\le z)\)\\\hline 0.5&0.191\\\hline\end{tabular}"
+                return {"text": table, "confidence": 0.97, "line_data": [{"text": table}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory) / "media"
+            source = media / "problems" / "1" / "problem-0001.webp"
+            source.parent.mkdir(parents=True)
+            image = Image.new("RGB", (600, 500), "white")
+            ImageDraw.Draw(image).rectangle((180, 100, 520, 390), outline="black", width=4)
+            image.save(source, "WEBP")
+            blocks = extract_raster_box_blocks(
+                "/media/problems/1/problem-0001.webp", media, "1", 1,
+                mathpix=FakeTableMathpix(), figure_detector=lambda _image: [(0, 0, 300, 250)],
+            )
+            self.assertEqual(blocks[0]["figures"], [])
+            self.assertFalse(any(item["type"] == "figure" for item in blocks[0]["elements"]))
+            self.assertIn(r"\begin{array}", blocks[0]["latex"])
+            self.assertNotIn(r"\begin{tabular}", blocks[0]["latex"])
+            self.assertNotIn(r"\hlinez", blocks[0]["latex"])
+            self.assertIn(r"\hline z", blocks[0]["latex"])
+            self.assertEqual(classify_box(blocks[0]["content"]), "table_block")
+            self.assertEqual(normalize_box_latex("ordinary text"), "ordinary text")
+
+    def test_condition_box_region_is_excluded_from_figure_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory) / "media"
+            source = media / "problems" / "1" / "problem-0001.webp"
+            source.parent.mkdir(parents=True)
+            image = Image.new("RGB", (600, 500), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((60, 80, 540, 400), outline="black", width=5)
+            draw.line((100, 170, 480, 170), fill="black", width=4)
+            image.save(source, "WEBP")
+            figures = extract_raster_figures_from_source(
+                "/media/problems/1/problem-0001.webp",
+                media,
+                "1",
+                1,
+                exclude_regions=[{"x":0.1,"y":0.16,"width":0.8,"height":0.64}],
+            )
+            self.assertEqual(figures, [])
+
+    def test_low_confidence_box_keeps_original_as_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory) / "media"
+            source = media / "problems" / "1" / "problem-0001.webp"
+            source.parent.mkdir(parents=True)
+            image = Image.new("RGB", (600, 500), "white")
+            ImageDraw.Draw(image).rectangle((80, 120, 520, 330), outline="black", width=4)
+            image.save(source, "WEBP")
+            blocks = extract_raster_box_blocks(
+                "/media/problems/1/problem-0001.webp", media, "1", 1
+            )
+            self.assertEqual(len(blocks), 1)
+            self.assertEqual(blocks[0]["display_mode"], "image_fallback")
+            self.assertTrue((media / blocks[0]["source_image"].removeprefix("/media/")).exists())
+
+    def test_box_mathpix_line_order_is_preserved(self):
+        class FakeBoxMathpix:
+            configured = True
+
+            def process_image(self, _path):
+                return {
+                    "text": "조건 x=1\ny=2",
+                    "confidence": 0.95,
+                    "line_data": [
+                        {"text": "조건 x=1", "cnt": [[0, 12], [100, 12], [100, 28], [0, 28]]},
+                        {"text": "y=2", "cnt": [[0, 42], [80, 42], [80, 58], [0, 58]]},
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory) / "media"
+            source = media / "problems" / "1" / "problem-0001.webp"
+            source.parent.mkdir(parents=True)
+            image = Image.new("RGB", (600, 500), "white")
+            ImageDraw.Draw(image).rectangle((80, 120, 520, 330), outline="black", width=4)
+            image.save(source, "WEBP")
+            blocks = extract_raster_box_blocks(
+                "/media/problems/1/problem-0001.webp", media, "1", 1, mathpix=FakeBoxMathpix()
+            )
+            self.assertEqual(blocks[0]["display_mode"], "structured")
+            self.assertEqual([item["content"] for item in blocks[0]["elements"]], ["조건 x=1", "y=2"])
+
     def test_raster_diagram_is_separated_from_text_rows(self):
         image = Image.new("RGB", (600, 800), "white")
         draw = ImageDraw.Draw(image)
@@ -79,6 +224,25 @@ class ExtractorTests(unittest.TestCase):
         self.assertGreater(top, 180)
         self.assertGreater(right - left, 250)
         self.assertGreater(bottom - top, 300)
+
+    def test_full_problem_scan_is_not_saved_as_a_figure(self):
+        class ScannedPage:
+            height = 800
+            images = [{"x0": 0, "top": 0, "x1": 600, "bottom": 800}]
+            curves: list[dict] = []
+            rects: list[dict] = []
+            lines: list[dict] = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            page_image = root / "page.png"
+            Image.new("RGB", (600, 800), "white").save(page_image)
+            problem = {"segments": [{
+                "page": 1, "page_width": 600, "page_height": 800,
+                "x0": 0, "top": 0, "x1": 600, "bottom": 800,
+            }]}
+            figures = extract_figures(problem, [ScannedPage()], [page_image], root / "media", 1, 1)
+            self.assertEqual(figures, [])
 
     def test_figure_cleanup_removes_colored_and_faint_marks(self):
         image = Image.new("RGB", (120, 80), "white")
