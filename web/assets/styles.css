@@ -210,6 +210,12 @@ img { max-width: 100%; }
 .firebase-user-line { display:grid; gap:3px; padding:13px 14px; border-radius:12px; background:#f6f9ff; }
 .firebase-user-line b { font-size:12px; }
 .firebase-user-line span { color:var(--muted); font-size:9px; }
+.firebase-auth-help { display:grid; gap:6px; margin-top:12px; padding:12px 13px; border-radius:10px; background:#fff8e8; color:#7c5922; font-size:9px; line-height:1.55; }
+.firebase-auth-help b { font-size:10px; }
+.firebase-auth-help code { padding:1px 4px; border-radius:4px; background:rgba(124,89,34,.1); font-family:Consolas,monospace; }
+.firebase-auth-help a { color:#17483a; font-weight:800; text-decoration:none; }
+.gemini-card { border-color:#dddafa; }
+.gemini-logo { background:linear-gradient(145deg,#4776f4,#9b5cff); color:white; }
 
 .ocr-banner { display:flex; align-items:center; gap:15px; margin-bottom:13px; padding:13px 15px; border:1px solid #f0d9b8; border-radius:12px; background:var(--amber-bg); }
 .ocr-banner.connected { border-color:#c9e6da; background:#ecf8f3; }

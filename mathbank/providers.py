@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -246,6 +247,40 @@ class MathpixProvider:
                 pass
 
 
+class GeminiProvider:
+    base_url = "https://generativelanguage.googleapis.com/v1beta"
+
+    def __init__(self, api_key: str | None = None):
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+    def test_connection(self) -> dict[str, Any]:
+        if not self.configured:
+            raise ProviderError("Gemini API Key를 입력해 주세요.")
+        request = urllib.request.Request(
+            f"{self.base_url}/models?key={urllib.parse.quote(self.api_key)}",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise ProviderError(f"Gemini 요청 실패({exc.code}): {detail[:300]}", exc.code) from exc
+        except urllib.error.URLError as exc:
+            raise ProviderError(f"Gemini 연결 실패: {exc.reason}") from exc
+        models = data.get("models") or []
+        return {
+            "ok": True,
+            "method": "models",
+            "model_count": len(models),
+        }
+
+
 def split_mathpix_markdown(markdown: str) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
     current: list[str] = []
@@ -291,13 +326,19 @@ def merge_mathpix(problems: list[dict[str, Any]], markdown: str) -> tuple[list[d
     return problems, note
 
 
-def provider_status(app_id: str = "", app_key: str = "") -> dict[str, Any]:
+def provider_status(app_id: str = "", app_key: str = "", gemini_api_key: str = "") -> dict[str, Any]:
     mathpix = MathpixProvider(app_id=app_id, app_key=app_key)
+    gemini = GeminiProvider(api_key=gemini_api_key)
     return {
         "mathpix": {
             "configured": mathpix.configured,
             "label": "Mathpix 수학 OCR",
             "purpose": "수식·본문을 LaTeX로 변환",
+        },
+        "gemini": {
+            "configured": gemini.configured,
+            "label": "Gemini AI 보조 OCR",
+            "purpose": "Mathpix 실패 시 수식·본문 보정 후보",
         },
         "azure": {
             "configured": bool(os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT") and os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY")),

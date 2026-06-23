@@ -114,6 +114,13 @@ export async function initFirebaseSync(options = {}) {
   statusCallback = options.onStatusChange || statusCallback;
   await loadSdk();
   const auth = appAuth();
+  sdk.auth.getRedirectResult(auth).catch(error => {
+    const code = String(error?.code || "");
+    syncState.error = code.includes("unauthorized-domain")
+      ? "Firebase에서 현재 앱 주소를 허용하지 않았습니다. Firebase Console의 Authorized domains에 localhost와 127.0.0.1을 추가해 주세요."
+      : `Firebase 로그인 확인 실패: ${error.message}`;
+    emitStatus();
+  });
   sdk.auth.onAuthStateChanged(auth, user => {
     syncState.user = user ? {
       uid: user.uid,
@@ -129,10 +136,18 @@ export async function initFirebaseSync(options = {}) {
 }
 
 export async function signInFirebase() {
+  if (location.hostname === "127.0.0.1") {
+    const nextUrl = `${location.protocol}//localhost:${location.port || "8765"}${location.pathname}${location.search}${location.hash || "#settings"}`;
+    syncState.error = "Firebase 로그인은 localhost 주소에서 다시 열어야 합니다. 주소를 자동으로 바꾸는 중입니다.";
+    emitStatus();
+    location.replace(nextUrl);
+    return {redirecting: true};
+  }
   await loadSdk();
   const provider = new sdk.auth.GoogleAuthProvider();
   provider.setCustomParameters({prompt: "select_account"});
-  await sdk.auth.signInWithPopup(appAuth(), provider);
+  localStorage.setItem("mathbank-firebase-login-started", new Date().toISOString());
+  await sdk.auth.signInWithRedirect(appAuth(), provider);
 }
 
 export async function signOutFirebase() {
@@ -214,6 +229,11 @@ export function firebaseSettingsPanel() {
   const countLine = syncState.user
     ? `클라우드에 문서 ${syncState.counts.documents}개 · 문제 ${syncState.counts.problems}개 · 시험지 ${syncState.counts.exams}개`
     : "로그인 후 이 컴퓨터의 문제 데이터를 Firebase로 올릴 수 있습니다.";
+  const authHelp = syncState.user ? "" : `<div class="firebase-auth-help">
+    <b>Google 로그인 화면이 열리지 않으면</b>
+    <span>Firebase Console → Authentication → Settings → Authorized domains에 <code>localhost</code>와 <code>127.0.0.1</code>을 추가해 주세요.</span>
+    <a href="https://console.firebase.google.com/project/math-app-dfe8d/authentication/settings" target="_blank" rel="noreferrer">Firebase 인증 설정 열기 ↗</a>
+  </div>`;
   const lastPush = syncState.lastPushAt
     ? new Intl.DateTimeFormat("ko-KR", {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"}).format(new Date(syncState.lastPushAt))
     : "아직 없음";
@@ -225,6 +245,7 @@ export function firebaseSettingsPanel() {
     </div>
     <div class="firebase-user-line">${userLine}</div>
     <div class="connection-detail ${syncState.error ? "error" : "success"}"><b>동기화 상태</b><span>${syncState.error || countLine}</span><span>마지막 올리기: ${lastPush}</span></div>
+    ${authHelp}
     <div class="settings-actions">
       ${syncState.user ? '<button type="button" class="ghost-btn" id="firebase-signout">로그아웃</button><button type="button" class="primary-btn" id="firebase-push-local">현재 데이터 Firebase에 올리기</button>' : '<button type="button" class="primary-btn" id="firebase-signin">Google로 로그인</button>'}
     </div>

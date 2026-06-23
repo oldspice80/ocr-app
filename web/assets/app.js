@@ -273,7 +273,9 @@ async function renderSettings() {
   const config = await api('/api/settings/ocr');
   state.config = {...(state.config || {}), ...config};
   const mathpix = config.mathpix;
+  const gemini = config.gemini;
   const badgeLabel = mathpix.verified ? '연결 확인됨' : mathpix.configured ? '키 저장됨' : '연결 필요';
+  const geminiBadgeLabel = gemini.verified ? '연결 확인됨' : gemini.configured ? '키 저장됨' : '연결 필요';
   app.innerHTML = `<section class="settings-layout">
     <div class="settings-main-column">
     <article class="panel settings-card">
@@ -283,6 +285,14 @@ async function renderSettings() {
         <div class="field"><label>Mathpix App Key</label><input id="mathpix-app-key" type="password" autocomplete="new-password" placeholder="app_key를 입력하세요"><small>키는 이 컴퓨터의 로컬 데이터베이스에만 저장하며 화면에 다시 표시하지 않습니다.</small></div>
         ${mathpix.last_error ? `<div class="connection-detail error"><b>최근 연결 확인 실패</b><span>${esc(mathpix.last_error)}</span></div>` : mathpix.verified ? `<div class="connection-detail success"><b>실제 이미지 OCR 연결 확인 완료</b><span>${esc(mathpix.verified_at || '')}</span></div>` : ''}
         <div class="settings-actions"><button type="button" class="danger-btn" id="clear-mathpix" ${mathpix.configured ? '' : 'disabled'}>연결 해제</button>${mathpix.configured ? '<button type="button" class="soft-btn" id="test-mathpix">저장된 키 다시 확인</button>' : ''}<button type="submit" class="primary-btn" id="save-mathpix">키 저장 및 실제 OCR 확인</button></div>
+      </form>
+    </article>
+    <article class="panel settings-card gemini-card">
+      <div class="settings-head"><div class="settings-logo gemini-logo">G</div><div><span>GEMINI AI</span><h2>Gemini API 연결</h2><p>Mathpix가 실패했을 때 수식·본문을 AI로 보정하거나, 이후 이미지 기반 LaTeX 후보를 만드는 보조 엔진으로 사용할 수 있습니다.</p></div><span class="connection-badge ${gemini.verified ? 'connected' : gemini.configured ? 'saved' : ''}">${geminiBadgeLabel}</span></div>
+      <form id="gemini-settings-form">
+        <div class="field"><label>Gemini API Key</label><input id="gemini-api-key" type="password" autocomplete="new-password" placeholder="AIza... 형태의 API Key를 입력하세요"><small>${gemini.api_key_masked ? `현재 등록: ${esc(gemini.api_key_masked)} · ${esc(gemini.source)}` : 'Google AI Studio에서 발급받은 API Key를 입력합니다.'}</small></div>
+        ${gemini.last_error ? `<div class="connection-detail error"><b>최근 연결 확인 실패</b><span>${esc(gemini.last_error)}</span></div>` : gemini.verified ? `<div class="connection-detail success"><b>Gemini API 연결 확인 완료</b><span>${esc(gemini.verified_at || '')}</span></div>` : ''}
+        <div class="settings-actions"><button type="button" class="danger-btn" id="clear-gemini" ${gemini.configured ? '' : 'disabled'}>연결 해제</button>${gemini.configured ? '<button type="button" class="soft-btn" id="test-gemini">저장된 키 다시 확인</button>' : ''}<button type="submit" class="primary-btn" id="save-gemini">키 저장 및 연결 확인</button></div>
       </form>
     </article>
     ${firebaseSettingsPanel()}
@@ -295,6 +305,8 @@ async function renderSettings() {
   </section>`;
   document.querySelector('#mathpix-settings-form').addEventListener('submit', saveMathpixSettings);
   document.querySelector('#test-mathpix')?.addEventListener('click', testMathpixSettings);
+  document.querySelector('#gemini-settings-form').addEventListener('submit', saveGeminiSettings);
+  document.querySelector('#test-gemini')?.addEventListener('click', testGeminiSettings);
 }
 
 async function saveMathpixSettings(event) {
@@ -337,6 +349,48 @@ async function clearMathpixSettings() {
   await api('/api/settings/mathpix', {method:'DELETE'});
   state.config = null;
   toast('Mathpix 연결 정보를 지웠습니다.');
+  await renderSettings();
+}
+
+async function saveGeminiSettings(event) {
+  event.preventDefault();
+  const button = document.querySelector('#save-gemini');
+  const apiKey = document.querySelector('#gemini-api-key').value.trim();
+  if (!apiKey) return toast('Gemini API Key를 입력해 주세요.', 'error');
+  button.disabled = true;
+  button.textContent = 'Gemini 연결 확인 중…';
+  try {
+    const result = await api('/api/settings/gemini', {method:'POST', body:JSON.stringify({api_key:apiKey})});
+    state.config = null;
+    toast(result.verified ? 'Gemini 키를 저장하고 연결을 확인했습니다.' : '키는 저장했습니다. 아래의 연결 실패 상세 내용을 확인해 주세요.', result.verified ? '' : 'error');
+    await renderSettings();
+  } catch (error) {
+    toast(error.message, 'error');
+    button.disabled = false;
+    button.textContent = '키 저장 및 연결 확인';
+  }
+}
+
+async function testGeminiSettings() {
+  const button = document.querySelector('#test-gemini');
+  button.disabled = true;
+  button.textContent = 'Gemini 연결 확인 중…';
+  try {
+    const result = await api('/api/settings/gemini/test', {method:'POST', body:'{}'});
+    state.config = null;
+    toast(result.verified ? 'Gemini API 연결을 확인했습니다.' : '연결 확인에 실패했습니다. 상세 내용을 확인해 주세요.', result.verified ? '' : 'error');
+    await renderSettings();
+  } catch (error) {
+    toast(error.message, 'error');
+    button.disabled = false;
+    button.textContent = '저장된 키 다시 확인';
+  }
+}
+
+async function clearGeminiSettings() {
+  await api('/api/settings/gemini', {method:'DELETE'});
+  state.config = null;
+  toast('Gemini 연결 정보를 지웠습니다.');
   await renderSettings();
 }
 
@@ -887,6 +941,10 @@ document.addEventListener('click', async event => {
   if (event.target.closest('#refresh-btn') || event.target.closest('[data-retry]')) return navigate(state.route, true);
   if (event.target.closest('#clear-mathpix')) {
     if (confirm('저장된 Mathpix 연결 정보를 지울까요?')) clearMathpixSettings().catch(error => toast(error.message,'error'));
+    return;
+  }
+  if (event.target.closest('#clear-gemini')) {
+    if (confirm('저장된 Gemini 연결 정보를 지울까요?')) clearGeminiSettings().catch(error => toast(error.message,'error'));
     return;
   }
   if (event.target.closest('#firebase-signin')) {

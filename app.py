@@ -33,7 +33,7 @@ from mathbank.extractor import (
 )
 from mathbank.manual import detect_initial_regions, extract_manual_regions, normalize_regions, prepare_manual_pdf
 from mathbank.latex_text import latexize_plain_numbers
-from mathbank.providers import MathpixProvider, ProviderError, merge_mathpix, provider_status
+from mathbank.providers import GeminiProvider, MathpixProvider, ProviderError, merge_mathpix, provider_status
 
 
 ROOT = Path(__file__).resolve().parent
@@ -70,10 +70,15 @@ def configured_mathpix() -> MathpixProvider:
 def ocr_config_payload() -> dict:
     app_id = DB.get_setting("mathpix_app_id") or os.getenv("MATHPIX_APP_ID", "")
     app_key = DB.get_setting("mathpix_app_key") or os.getenv("MATHPIX_APP_KEY", "")
+    gemini_key = DB.get_setting("gemini_api_key") or os.getenv("GEMINI_API_KEY", "")
     masked_id = ""
     if app_id:
         masked_id = app_id[:4] + ("•" * max(4, len(app_id) - 6)) + app_id[-2:]
+    masked_gemini = ""
+    if gemini_key:
+        masked_gemini = gemini_key[:6] + ("•" * max(6, len(gemini_key) - 10)) + gemini_key[-4:]
     verified = DB.get_setting("mathpix_verified") == "1"
+    gemini_verified = DB.get_setting("gemini_verified") == "1"
     return {
         "mathpix": {
             "configured": bool(app_id and app_key),
@@ -83,7 +88,15 @@ def ocr_config_payload() -> dict:
             "last_error": DB.get_setting("mathpix_last_error"),
             "verified_at": DB.get_setting("mathpix_verified_at"),
         },
-        "providers": provider_status(app_id, app_key),
+        "gemini": {
+            "configured": bool(gemini_key),
+            "verified": gemini_verified,
+            "api_key_masked": masked_gemini,
+            "source": "앱 설정" if DB.get_setting("gemini_api_key") else ("환경변수" if gemini_key else "미설정"),
+            "last_error": DB.get_setting("gemini_last_error"),
+            "verified_at": DB.get_setting("gemini_verified_at"),
+        },
+        "providers": provider_status(app_id, app_key, gemini_key),
     }
 
 
@@ -677,6 +690,38 @@ class MathBankHandler(BaseHTTPRequestHandler):
                     DB.set_setting("mathpix_verified", "0")
                     DB.set_setting("mathpix_last_error", str(exc)[:1000])
                     return self.send_json({"verified": False, "warning": str(exc), **ocr_config_payload()})
+            if path == "/api/settings/gemini":
+                body = self.read_json()
+                api_key = str(body.get("api_key", "")).strip()
+                if not api_key:
+                    return self.send_error_json("Gemini API Key를 입력해 주세요.")
+                DB.set_setting("gemini_api_key", api_key)
+                DB.set_setting("gemini_verified", "0")
+                DB.set_setting("gemini_last_error", "")
+                provider = GeminiProvider(api_key=api_key)
+                try:
+                    test_result = provider.test_connection()
+                    DB.set_setting("gemini_verified", "1")
+                    DB.set_setting("gemini_verified_at", now_iso())
+                    DB.set_setting("gemini_last_error", "")
+                    return self.send_json({"saved": True, "verified": True, "test": test_result, **ocr_config_payload()})
+                except ProviderError as exc:
+                    DB.set_setting("gemini_last_error", str(exc)[:1000])
+                    return self.send_json({"saved": True, "verified": False, "warning": str(exc), **ocr_config_payload()})
+            if path == "/api/settings/gemini/test":
+                provider = GeminiProvider(api_key=DB.get_setting("gemini_api_key"))
+                if not provider.configured:
+                    return self.send_error_json("먼저 Gemini API Key를 저장해 주세요.", 409)
+                try:
+                    test_result = provider.test_connection()
+                    DB.set_setting("gemini_verified", "1")
+                    DB.set_setting("gemini_verified_at", now_iso())
+                    DB.set_setting("gemini_last_error", "")
+                    return self.send_json({"verified": True, "test": test_result, **ocr_config_payload()})
+                except ProviderError as exc:
+                    DB.set_setting("gemini_verified", "0")
+                    DB.set_setting("gemini_last_error", str(exc)[:1000])
+                    return self.send_json({"verified": False, "warning": str(exc), **ocr_config_payload()})
             match = re.fullmatch(r"/api/documents/(\d+)/prepare-regions", path)
             if match:
                 document_id = int(match.group(1))
@@ -953,6 +998,12 @@ class MathBankHandler(BaseHTTPRequestHandler):
             DB.set_setting("mathpix_verified", "0")
             DB.set_setting("mathpix_verified_at", "")
             DB.set_setting("mathpix_last_error", "")
+            return self.send_json({"ok": True, **ocr_config_payload()})
+        if path == "/api/settings/gemini":
+            DB.set_setting("gemini_api_key", "")
+            DB.set_setting("gemini_verified", "0")
+            DB.set_setting("gemini_verified_at", "")
+            DB.set_setting("gemini_last_error", "")
             return self.send_json({"ok": True, **ocr_config_payload()})
         if path == "/api/problems":
             body = self.read_json()
